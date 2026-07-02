@@ -1,0 +1,11 @@
+# compile dir
+dist/
+
+# temp dir
+tmp/
+
+# generated plugin artifacts
+smart-model-router.so
+smart-model-router.h
+smart-model-router.dylib
+smart-model-router.dll

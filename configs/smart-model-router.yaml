@@ -1,0 +1,147 @@
+# Example CLIProxyAPI configuration for smart-model-router.
+# Purpose: expose one virtual model (`router:auto`) and let the plugin choose
+# the best configured real model for each request, while keeping CLIProxyAPI
+# responsible for provider auth, execution, logging, and usage accounting.
+# Provider keys are built-in CLIProxyAPI providers confirmed by model-router docs/code:
+# - claude: Anthropic/Claude provider path
+# - codex: OpenAI/Codex/GPT-compatible provider path
+
+plugins:
+  # Global CLIProxyAPI plugin switch. This must be true or no plugin is loaded.
+  enabled: true
+
+  # Directory where smart-model-router.so/.dylib/.dll is installed.
+  dir: plugins
+  configs:
+    smart-model-router:
+      # Enables this plugin instance. The key must match the dynamic library filename.
+      enabled: true
+
+      # Higher priority routers run first. Keep this high so router:auto is handled early.
+      priority: 100
+
+      # Clients should send this as the request model.
+      virtual_model: router:auto
+
+      # hybrid = deterministic config ranking + optional classifier hint + cache/session state.
+      strategy: hybrid
+
+      # preference is an extra decision influencer: cost (cheapest acceptable),
+      # balanced (default), or quality (best). In llm/hybrid it biases the classifier
+      # prompt; in every mode it breaks real ties among equivalent-tier models.
+      preference: balanced
+
+      # Stores only non-sensitive runtime data: catalog IDs, pricing metadata,
+      # usage aggregates, route cache, session affinity, and counters.
+      state_path: smart-model-router-state.json
+
+      # Purpose: debug route decisions during tuning.
+      # Writes one JSON line per routed request, without prompts, bodies, or secrets.
+      debug:
+        enabled: false
+        log_path: smart-model-router-decisions.jsonl
+
+      # Purpose: validate configured model availability against the local CLIProxyAPI model list.
+      # /v1/models is not used to infer provider/capabilities; configured models below remain authoritative.
+      catalog:
+        source: cli_proxy_api
+        base_url: http://127.0.0.1:8317
+        api_key: ""
+        refresh_interval: 10m
+        include_router_model: false
+
+      # Purpose: fetch pricing metadata for future cost-aware scoring.
+      # Routing must continue if this URL is unavailable.
+      pricing:
+        enabled: true
+        url: https://raw.githubusercontent.com/ENTERPILOT/ai-model-price-list/refs/heads/main/sources/llm_prices_current.json
+        refresh_interval: 6h
+
+      # Purpose: avoid repeated classifier calls and keep repeated prompts stable.
+      # Cache keys are the hash of the last user message, so identical prompts reuse the same
+      # decision deterministically. When full, the least recently used entry is evicted (LRU).
+      cache:
+        enabled: true
+        max_entries: 1024
+        # Optional time-to-live; entries older than this are re-evaluated. Empty = never expire by age.
+        ttl: 24h
+
+      # Purpose: same-request retry for non-streaming requests.
+      # Keep disabled unless you explicitly want the plugin executor to try model A, then B, then C.
+      executor_fallback:
+        enabled: false
+        max_attempts: 3
+
+      # Purpose: optional semantic routing hint.
+      # Ordered classifier fallback. These models must also exist in the configured candidates.
+      # If all classifier attempts fail, deterministic routing below still works.
+      classifier:
+        enabled: true
+        models:
+          - provider: codex
+            model: gpt-5.4-mini
+          - provider: claude
+            model: claude-haiku-4-5-20251001
+        timeout: 8s
+        max_attempts: 2
+
+      # Purpose: policy knobs for scoring and route stability.
+      # Current routing always has deterministic fallback, even when classifier is enabled.
+      routing:
+        prefer_low_cost: true
+        prefer_low_latency: false
+        prefer_high_quality: true
+        max_cost_per_request: 0.05
+        max_input_tokens: 100000
+        keep_same_model_per_session: true
+        allow_fallback: true
+        switch_threshold: 0.15
+        benchmark_weight: 0.4
+        llm_router_weight: 0.3
+        capability_weight: 0.3
+
+      # Purpose: authoritative provider/model matrix.
+      # Candidate order is the deterministic fallback priority.
+      # Keep provider/model mappings explicit; /v1/models is used only to validate/enrich status.
+      models:
+        # Best for highest-stakes reasoning, architecture, deep analysis, long-form synthesis.
+        - provider: claude
+          model: claude-opus-4-8
+          capabilities: [reasoning, architecture, planning, analysis, writing, long_context, high_quality]
+          cost: very_high
+          quality: highest
+
+        # Best default Claude model for coding, agents, balanced reasoning, refactors, reviews.
+        - provider: claude
+          model: claude-sonnet-5
+          capabilities: [coding, reasoning, review, refactor, tools, architecture, writing]
+          cost: high
+          quality: high
+
+        # Best cheap/fast Claude model for classification, summarization, translation, routing.
+        - provider: claude
+          model: claude-haiku-4-5-20251001
+          capabilities: [classify, summarize, translate, fast, low_cost, routing]
+          cost: low
+          quality: medium
+
+        # Best GPT option for top-tier reasoning, coding, agents, complex tool use.
+        - provider: codex
+          model: gpt-5.5
+          capabilities: [coding, reasoning, agents, tools, architecture, analysis, high_quality]
+          cost: very_high
+          quality: highest
+
+        # Strong general-purpose GPT model for coding, reasoning, and balanced workloads.
+        - provider: codex
+          model: gpt-5.4
+          capabilities: [coding, reasoning, tools, review, writing, documentation, tests, scripts, general]
+          cost: high
+          quality: high
+
+        # Best low-cost GPT option for routing, classification, summaries, simple coding.
+        - provider: codex
+          model: gpt-5.4-mini
+          capabilities: [classify, summarize, translate, simple_coding, fast, low_cost, routing]
+          cost: low
+          quality: medium
