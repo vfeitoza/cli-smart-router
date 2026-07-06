@@ -17,6 +17,8 @@ This repository currently implements the router core plus the advanced features 
 - External pricing fetch metadata through `host.http.do` when configured.
 - Deterministic route cache with last-user-message hash keys, LRU eviction, and optional TTL.
 - Session affinity for stable per-session routing.
+- Local capability-aware deterministic scoring computed for every strategy, gating candidates by capabilities inferred from the prompt.
+- Local-first `hybrid` strategy: skips the classifier when the local decision is confident, calls the classifier only when it is not.
 - Optional LLM classifier routing through `host.model.execute` with isolated routing prompts.
 - Cost/balanced/quality routing preference through `preference`.
 - Optional same-request non-streaming fallback through plugin executor mode.
@@ -34,7 +36,8 @@ cmd/plugin/
 internal/domain/
   config.go                # Config entities and normalization
   model.go                 # Candidate and decision types
-  policy.go                # Deterministic candidate selection
+  policy.go                # Capability-aware candidate scoring and selection
+  capability.go            # Prompt -> capability tag inference
 internal/application/
   router.go                # Routing use case
   registrar.go             # Virtual model registration use case
@@ -45,6 +48,7 @@ internal/infrastructure/
   yaml_config.go           # config_yaml parsing
   state.go                 # In-memory config store
   runtime_state.go         # Non-sensitive runtime state, cache, catalog, pricing metadata
+  prompt.go                # Shared last-user-message extraction
 ```
 
 All code comments and configuration field descriptions are in English.
@@ -65,10 +69,13 @@ Decision order:
 
 1. Existing session route, when session affinity is enabled.
 2. Existing cache route, when cache is enabled and a valid entry exists.
-3. Classifier route, when `strategy` is `llm` or `hybrid`.
-4. Deterministic fallback.
+3. Local capability-aware deterministic decision, computed for every strategy without any classifier call.
+4. `hybrid`: use the local decision directly when it is confident (the prompt matched a capability the winning candidate declares); otherwise call the classifier. `llm`: always call the classifier. `capability`/`benchmark`: always use the local decision.
+5. If the classifier is called and fails, use the local decision from step 3.
 
-The classifier receives an isolated routing prompt with the configured model catalog and the extracted last user message. It must select a configured model; invalid classifier output falls back to deterministic routing.
+The local decision infers capability tags from the extracted last user message (for example, "resuma" implies `summarize`; "arquitetura" implies `architecture`/`planning`; "erro"/"bug" implies `coding`/`review`) and, when at least one candidate declares a matching capability, narrows selection to candidates that do. `preference` then ranks the remaining pool by cost/quality tier. See `docs/adr/0003-local-first-hybrid-routing.md` for details.
+
+The classifier, when called, receives an isolated routing prompt with the configured model catalog and the extracted last user message. It must select a configured model; invalid classifier output falls back to the local deterministic decision.
 
 Default provider-route response:
 
@@ -81,6 +88,8 @@ Default provider-route response:
   "Reason": "classifier:short routing reason"
 }
 ```
+
+A `hybrid` request that skipped the classifier because the local decision was confident has a `Reason` prefixed with `local_confident`, for example `"local_confident deterministic_fallback strategy:hybrid capabilities:1/1 preference:balanced provider:codex cost:low"`.
 
 When `executor_fallback.enabled: true` and the request is non-streaming, `model.route` returns `TargetKind: "self"`. The plugin executor then tries configured candidates in order with `host.model.execute` until one succeeds.
 
@@ -172,7 +181,7 @@ plugins:
 | Field | Type | Description |
 | --- | --- | --- |
 | `virtual_model` | string | Virtual model name intercepted by the router. Defaults to `router:auto`. |
-| `strategy` | enum | Routing strategy: `capability`, `benchmark`, `llm`, or `hybrid`. `llm`/`hybrid` try classifier routing before deterministic fallback. |
+| `strategy` | enum | Routing strategy: `capability`, `benchmark`, `llm`, or `hybrid`. `llm` always tries the classifier first; `hybrid` tries the classifier only when the local capability-aware decision is not confident. |
 | `preference` | enum | Decision influencer: `cost`, `balanced`, or `quality`. Defaults to `balanced`. |
 | `state_path` | string | Optional local JSON file for non-sensitive runtime state. |
 | `debug` | object | Optional JSONL route decision logging. |
@@ -190,10 +199,10 @@ Complete field documentation is available in `docs/configuration.md`.
 
 Supported strategies:
 
-- `capability`: deterministic fallback only.
-- `benchmark`: currently behaves like deterministic fallback; benchmark scoring is reserved for future measured data.
-- `llm`: classifier first, deterministic fallback on failure.
-- `hybrid`: same operational behavior as `llm` today.
+- `capability`: local capability-aware deterministic decision only. No classifier call.
+- `benchmark`: currently behaves like `capability`; benchmark scoring is reserved for future measured data.
+- `llm`: classifier first on every request, local deterministic decision as fallback on failure.
+- `hybrid`: local-first. Uses the local decision directly when it is confident, skipping the classifier; otherwise behaves like `llm` for that request.
 
 Supported preferences:
 
@@ -201,7 +210,20 @@ Supported preferences:
 - `balanced`: default balance of cost and quality.
 - `quality`: bias toward higher-quality models.
 
-`preference` biases the classifier prompt, affects deterministic fallback ranking, and applies conservative post-classifier tiebreaks among equivalent-tier models.
+`preference` ranks the local capability-gated candidate pool, biases the classifier prompt (`llm`, or `hybrid` when not confident), and applies conservative post-classifier tiebreaks among equivalent-tier models.
+
+## Local-First Hybrid Routing
+
+Every strategy computes a local decision from configuration alone, with no host call: it infers capability tags from the extracted last user message (see `models[].capabilities` below), narrows candidates to those declaring a matching capability when at least one does, and ranks the result by `preference`.
+
+The decision is "confident" only when the prompt matched a known capability signal and the winning candidate declares it. `strategy: hybrid` uses this to skip the classifier entirely for prompts the configuration already answers clearly, for example:
+
+- "resuma isso" -> a low-cost/summarize-capable model, no classifier call.
+- "corrija este erro Go..." -> a coding/review-capable model, no classifier call.
+- "planeje a arquitetura de..." -> an architecture/planning-capable model, no classifier call.
+- "faça isso melhor" -> ambiguous, no capability matched, classifier is called.
+
+An ambiguous prompt, or a configuration where no candidate declares a matching capability, always falls through to the classifier under `hybrid` (or is used as-is under `capability`/`benchmark`, which never call a classifier). See `docs/adr/0003-local-first-hybrid-routing.md` for the full design rationale.
 
 ## Deterministic Cache
 
@@ -215,7 +237,7 @@ Cache behavior:
 - LRU eviction removes the least recently used entry when full.
 - `cache.ttl` optionally expires old decisions.
 
-The first request logs `source: selected`; repeated matching prompts should log `source: cache`.
+The first request logs `source: selected`; repeated matching prompts should log `source: cache`. A `hybrid` request that used the local confident decision instead of the classifier still logs `source: selected`, with `reason` prefixed by `local_confident`.
 
 ## Management Status
 

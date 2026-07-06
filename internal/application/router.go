@@ -23,14 +23,17 @@ func (r Router) Route(req infrastructure.ModelRouteRequest) domain.RouteDecision
 	for _, item := range cfg.Models {
 		candidates = append(candidates, domain.CandidateFromConfig(item))
 	}
-	candidate, ok := domain.SelectCandidateForPrompt(candidates, req.AvailableProviders, string(req.Body), cfg.Preference)
+	prompt := infrastructure.ExtractUserPrompt(req.Body)
+	score, ok := domain.SelectCandidateWithConfidence(candidates, req.AvailableProviders, prompt, cfg.Preference)
 	if !ok {
 		return domain.RouteDecision{Handled: false, Reason: "no_available_candidate"}
 	}
+	candidate := score.Candidate
 	return domain.RouteDecision{
 		Handled:        true,
 		TargetProvider: candidate.Provider,
 		TargetModel:    candidate.Model,
-		Reason:         fmt.Sprintf("deterministic_fallback strategy:%s preference:%s provider:%s cost:%s", cfg.Strategy, cfg.Preference, candidate.Provider, candidate.Cost),
+		Reason:         fmt.Sprintf("deterministic_fallback strategy:%s %s provider:%s cost:%s", cfg.Strategy, score.Reason, candidate.Provider, candidate.Cost),
+		Confident:      score.LocalConfident(),
 	}
 }

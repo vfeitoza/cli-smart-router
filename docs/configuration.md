@@ -123,12 +123,12 @@ Default in code: `capability`
 
 Current behavior:
 
-- `capability`: uses deterministic local routing only.
-- `benchmark`: currently uses the same deterministic fallback path; benchmark-specific scoring fields are kept as policy metadata for future scoring.
-- `llm`: tries the configured classifier models first, then falls back to deterministic routing if classification fails.
-- `hybrid`: same current behavior as `llm`: classifier first, deterministic fallback always available.
+- `capability`: uses the local capability-aware deterministic decision only. No classifier call.
+- `benchmark`: currently uses the same local deterministic decision path; benchmark-specific scoring fields are kept as policy metadata for future scoring.
+- `llm`: tries the configured classifier models first on every request, then falls back to the local deterministic decision if classification fails.
+- `hybrid`: local-first. Computes the local deterministic decision first (no host call); if that decision is confident (the prompt matched a capability declared by the winning candidate; see `models[].capabilities` below), it is used directly and the classifier is skipped. Otherwise, behaves like `llm` for that request: classifier first, local decision as fallback.
 
-Deterministic fallback never calls a classifier and keeps the router operational if the classifier fails.
+The local deterministic decision never calls a classifier and keeps the router operational if the classifier fails.
 
 Example:
 
@@ -150,10 +150,11 @@ Default in code: `balanced`
 
 Invalid or empty values are normalized to `balanced`.
 
-This field influences model selection in two places:
+This field influences model selection in three places:
 
-- In `llm` and `hybrid`, it biases the classifier prompt.
-- In all modes, it breaks real ties among equivalent-tier models.
+- In local capability-aware scoring (used by every strategy), it ranks the pool of candidates gated by inferred capabilities.
+- In `llm`, and in `hybrid` when the local decision is not confident, it biases the classifier prompt.
+- In all modes, it breaks real ties among equivalent-tier models after classifier selection.
 
 Behavior:
 
@@ -424,9 +425,15 @@ classifier:
 
 Type: `bool`
 
-Enables classifier routing attempts when `strategy` is `llm` or `hybrid`.
+Enables classifier routing attempts.
 
-If disabled, or if the strategy is not `llm`/`hybrid`, deterministic fallback is used.
+Behavior by strategy:
+
+- `llm`: the classifier is attempted on every request when enabled.
+- `hybrid`: the classifier is attempted only when the local capability-aware decision is not confident (see `strategy` above and `models[].capabilities` below).
+- `capability` / `benchmark`: the classifier is never attempted regardless of this setting.
+
+If disabled, or if the strategy is not `llm`/`hybrid`, the local deterministic decision is used directly.
 
 ### `classifier.models`
 
@@ -603,7 +610,14 @@ Examples:
 
 Type: list of strings
 
-Free-form capability tags used in classifier context and documentation. They are normalized to lowercase.
+Capability tags normalized to lowercase. These tags are used in two places:
+
+- classifier context, as before;
+- local capability-aware scoring (every strategy): the router infers capability tags from the prompt using a small keyword matcher (for example, "resuma"/"summarize" implies `summarize`; "arquitetura"/"architecture" implies `architecture`/`planning`; "erro"/"bug" implies `coding`/`review`). If the prompt matches an inferred capability and at least one candidate declares it, only candidates declaring a matching capability are eligible for that request; `preference` then ranks the remaining pool by cost/quality tier.
+
+Candidates that omit `capabilities` are never excluded by this gate on their own account, but they can be excluded by *other* candidates' matching capabilities when the prompt clearly implies a capability none of them declare. If no configured candidate declares any inferred capability, the gate has no effect for that request and ranking falls back to plain cost/quality tier ranking, same as when `capabilities` is omitted entirely.
+
+Configuring accurate `capabilities` is what allows `strategy: hybrid` to skip the classifier for prompts the configuration already answers clearly. See `docs/adr/0003-local-first-hybrid-routing.md`.
 
 Common tags in the example:
 
@@ -667,30 +681,39 @@ For a request matching `virtual_model`, route selection currently happens in thi
 
 1. Session route, when `routing.keep_same_model_per_session` is enabled and a session route exists.
 2. Cache route, when `cache.enabled` is true and a valid cache entry exists.
-3. Classifier route, when `strategy` is `llm` or `hybrid` and `classifier.enabled` is true.
-4. Deterministic fallback route.
+3. Local capability-aware deterministic decision, computed for every strategy (no classifier call).
+4. `hybrid`: use the local decision directly if it is confident; otherwise call the classifier. `llm`: always call the classifier. `capability`/`benchmark`: always use the local decision from step 3.
+5. If the classifier is called and fails, use the local decision from step 3.
 
 After classifier selection, `preference` may apply a conservative tiebreak among equivalent-tier candidates.
 
 The selected route is stored in cache and optionally pinned to the session.
 
-## Deterministic Fallback
+## Local Capability-Aware Decision
 
-Deterministic fallback selects an available configured candidate that is strong enough for the prompt according to simple local text signals.
+The local decision selects an available configured candidate that is strong enough for the prompt, using local text signals plus configured `capabilities`. It is computed for every strategy and used directly by `capability`/`benchmark`, as the direct decision for confident `hybrid` requests, and as the fallback when a classifier call fails or is skipped.
 
-Current local signals:
+Current local signals for minimum cost tier:
 
 - Simple arithmetic/classification/summary requests can use `low` cost candidates.
 - Prompts containing signals such as `detalhes`, `como funciona`, `explique`, `código`, or `codigo` require at least `high` cost candidates.
 
-Then `preference` decides the ranking:
+Current local signals for capability gating (see `models[].capabilities` above for the full list): `resuma`/`summarize` implies `summarize`; `traduza`/`translate` implies `translate`; `classifique`/`classify` implies `classify`; `erro`/`bug`/`falha` implies `coding`/`review`; `refatora`/`refactor` implies `refactor`/`coding`; `arquitetura`/`design`/`planeje` implies `architecture`/`planning`; `explique`/`analise`/`compare` implies `reasoning`/`analysis`; `teste`/`coverage` implies `tests`/`coding`; `agente`/`ferramenta`/`tool` implies `agents`/`tools`; long prompts imply `long_context`.
+
+If the prompt matches an inferred capability and at least one eligible candidate declares it, only candidates declaring a matching capability remain eligible. Otherwise this gate has no effect.
+
+Then `preference` decides the ranking of the gated pool:
 
 - `quality`: highest quality first, cheaper model as secondary tie-break.
 - `cost` or `balanced`: lowest cost first, higher quality as secondary tie-break.
 
+The decision is considered "locally confident" only when the prompt matched an inferred capability and the winning candidate declares it. `hybrid` uses this to decide whether to call the classifier.
+
 ## Classifier Behavior
 
 The classifier is a small model call used only to choose a target model. It does not answer the user's request.
+
+`llm` calls the classifier on every request. `hybrid` calls the classifier only when the local decision above is not confident.
 
 The classifier receives:
 
@@ -701,7 +724,7 @@ The classifier receives:
 
 It returns a selected model ID, confidence, and short reason. The selected model must exist in `models` and its provider must be available.
 
-If anything fails, routing falls back deterministically.
+If anything fails, routing falls back to the local capability-aware decision.
 
 ## Cache Behavior
 
@@ -724,17 +747,25 @@ Cache storage:
 
 ## Debug Log Example
 
-Example JSONL decision log:
+Example JSONL decision log using the classifier (`llm`, or `hybrid` with a non-confident local decision):
 
 ```json
 {"time":"2026-07-02T07:29:55.089425433-03:00","source":"selected","virtual_model":"claude-auto","source_format":"openai","stream":true,"strategy":"llm","preference":"balanced","target_provider":"claude","target_model":"claude-sonnet-5","reason":"classifier:Pedido envolve arquitetura, implementação em Go, JWT e plano de performance; Sonnet atende bem sem subir ao modelo mais caro.","classifier":{"enabled":true,"used":true,"model":"gpt-5.4-mini","response":"{\"selected_model\":\"claude-sonnet-5\",\"confidence\":0.94,\"reason\":\"...\"}"}}
 ```
 
+Example JSONL decision log for a `hybrid` request that skipped the classifier because the local decision was confident:
+
+```json
+{"time":"2026-07-02T07:31:10.221004112-03:00","source":"selected","virtual_model":"router:auto","source_format":"openai","stream":false,"strategy":"hybrid","preference":"balanced","target_provider":"codex","target_model":"gpt-5.4-mini","reason":"local_confident deterministic_fallback strategy:hybrid capabilities:1/1 preference:balanced provider:codex cost:low"}
+```
+
 Possible `source` values:
 
-- `selected`: freshly selected by classifier or deterministic fallback
+- `selected`: freshly selected by classifier or the local deterministic decision
 - `cache`: reused from route cache
 - `session`: reused from session affinity
+
+A `reason` prefixed with `local_confident` indicates `hybrid` used the local decision and skipped the classifier for that request.
 
 ## Security Notes
 

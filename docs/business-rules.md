@@ -46,6 +46,8 @@ The configured `models` list is authoritative for:
 - cost tier
 - quality tier
 
+`capabilities` is not documentation-only: it directly gates local capability-aware routing (see Local Capability-Aware Routing Rule) in addition to being sent to the classifier.
+
 `/v1/models` may be used to validate or enrich availability state, but it must not be used to infer provider or capability metadata for unmapped models.
 
 ## Candidate Validity Rule
@@ -68,12 +70,30 @@ Supported strategy values are:
 
 Current behavior:
 
-- `capability`: deterministic fallback only.
-- `benchmark`: currently behaves like deterministic fallback; benchmark fields are reserved for future scoring.
-- `llm`: classifier first, deterministic fallback on classifier failure.
-- `hybrid`: same operational behavior as `llm` today.
+- `capability`: local capability-aware deterministic decision only. No classifier call.
+- `benchmark`: currently behaves like `capability`; benchmark fields are reserved for future scoring.
+- `llm`: classifier first on every request, local deterministic decision as fallback on classifier failure.
+- `hybrid`: local-first. Uses the local decision directly when it is locally confident, skipping the classifier; otherwise behaves like `llm` for that request.
 
-Every strategy must keep deterministic fallback available so the router remains operational when advanced features fail.
+Every strategy must keep the local deterministic decision available so the router remains operational when advanced features fail.
+
+## Local Capability-Aware Routing Rule
+
+Before any classifier call, the router always computes a local decision from configuration alone:
+
+1. Infer capability tags from the extracted last user message using a small keyword matcher (for example: "resuma" implies `summarize`; "arquitetura" implies `architecture`/`planning`; "erro"/"bug" implies `coding`/`review`).
+2. Filter candidates the same way as deterministic fallback always has: valid provider/model, available provider, and minimum cost tier for the prompt.
+3. If the prompt matched at least one inferred capability and at least one eligible candidate declares it, keep only candidates declaring a matching capability. Otherwise, this step is a no-op and every eligible candidate remains in the pool.
+4. Rank the remaining pool by `preference`, exactly as the pre-existing deterministic ranking rules describe below.
+
+The local decision is "confident" only when both of these hold:
+
+- the prompt matched at least one known capability signal;
+- the winning candidate declares at least one of the matched capabilities.
+
+An ambiguous prompt (no capability signal matched) or a configuration where no candidate declares a matching capability is never confident, even though a candidate is still deterministically chosen by cost/quality tier ranking.
+
+`hybrid` uses this confidence to decide whether to call the classifier. `capability`, `benchmark`, and the fallback path of `llm` use the local decision regardless of confidence, because they have no classifier step (or the classifier already failed).
 
 ## Preference Rule
 
@@ -96,7 +116,9 @@ Business meaning:
 
 ## Classifier Rule
 
-When `strategy` is `llm` or `hybrid` and `classifier.enabled` is true, the plugin should attempt semantic classification before deterministic fallback.
+When `strategy` is `llm`, the plugin always attempts semantic classification before using the local deterministic decision, provided `classifier.enabled` is true.
+
+When `strategy` is `hybrid` and `classifier.enabled` is true, the plugin attempts semantic classification only when the local capability-aware decision (see Local Capability-Aware Routing Rule) is not confident. A confident local decision is used directly and the classifier is not called for that request.
 
 The classifier must choose a model from the configured `models` catalog.
 
@@ -136,12 +158,13 @@ If all classifier attempts fail, deterministic fallback must be used.
 
 ## Last User Message Rule
 
-Routing classification and cache keys must use the extracted last user message, not the full conversation history.
+Routing classification, cache keys, and local capability-aware scoring must all use the same extracted last user message, not the full conversation history or raw request body.
 
 Reason:
 
 - The same user prompt should route deterministically even when prior conversation history differs.
 - Historical context from tools or previous messages should not dominate model selection for the current request.
+- Using the same extracted text for cache keys, the classifier, and local scoring keeps all three decision paths consistent for the same request; scoring the raw request body could otherwise disagree with the cache key or classifier input.
 
 The plugin must support common request body shapes such as OpenAI/Claude `messages` and Gemini `contents.parts`.
 
@@ -180,28 +203,33 @@ For matching virtual-model requests, route selection order is:
 
 1. Existing session route.
 2. Existing cache route.
-3. Classifier route for `llm` or `hybrid`.
-4. Deterministic fallback.
+3. Local capability-aware deterministic decision, computed always (no classifier call).
+4. For `hybrid`: use the local decision directly if confident; otherwise call the classifier.
+5. For `llm`: call the classifier regardless of local confidence.
+6. If the classifier is called and fails, use the local decision from step 3 (this is the deterministic fallback).
 
 Newly selected routes should be cached when cache is enabled and pinned to the session when session affinity is enabled.
 
 ## Deterministic Fallback Rule
 
-Deterministic fallback chooses from configured candidates without calling any LLM.
+The local decision selects from configured candidates without calling any LLM. It is used directly by `capability`/`benchmark`, and as the fallback for `llm`/`hybrid` classifier failure, and as the direct decision for `hybrid` when confident.
 
 It must:
 
 - filter invalid candidates
 - respect available providers
 - estimate the minimum required cost tier from simple prompt signals
-- apply `preference`
+- gate eligible candidates by capabilities inferred from the prompt, when at least one eligible candidate declares a matching capability (see Local Capability-Aware Routing Rule)
+- apply `preference` to rank the gated pool
 
-Current prompt signals:
+Current prompt signals for minimum cost tier:
 
 - Simple arithmetic/classification/summary requests can use `low` cost models.
 - Prompts containing `detalhes`, `como funciona`, `explique`, `código`, or `codigo` require at least `high` cost models.
 
-Ranking by preference:
+Current prompt signals for capability inference include: `resuma`/`summarize` implies `summarize`; `traduza`/`translate` implies `translate`; `classifique`/`classify` implies `classify`; `erro`/`bug`/`falha`/`exception` implies `coding`/`review`; `refatora`/`refactor` implies `refactor`/`coding`; `arquitetura`/`architecture`/`design`/`planeje` implies `architecture`/`planning`; `explique`/`explain`/`analise`/`compare` implies `reasoning`/`analysis`; `teste`/`unit test`/`coverage` implies `tests`/`coding`; `agente`/`agent`/`ferramenta`/`tool` implies `agents`/`tools`; `documenta`/`documentation` implies `documentation`/`writing`; `escreva`/`write` implies `writing`; `revis`/`review` implies `review`; prompts longer than roughly 1200 characters imply `long_context`.
+
+Ranking by preference within the gated pool:
 
 - `quality`: highest quality first, cost as secondary tie-break.
 - `cost`: lowest cost first, quality as secondary tie-break.

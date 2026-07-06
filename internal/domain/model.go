@@ -33,6 +33,11 @@ type RouteDecision struct {
 	TargetProvider string
 	TargetModel    string
 	Reason         string
+	// Confident reports whether local capability-aware scoring matched at least
+	// one capability signal inferred from the prompt. Callers implementing the
+	// hybrid strategy use this to skip the classifier when the local decision
+	// is already well-supported by configured `models.capabilities`.
+	Confident bool
 }
 
 func normalizeStrings(values []string) []string {

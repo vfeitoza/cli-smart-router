@@ -13,8 +13,10 @@ Client request
       -> smart-model-router
         -> session route, if pinned
         -> cache route, if hit
-        -> classifier route, for llm/hybrid strategy
-        -> deterministic fallback
+        -> local capability-aware scoring (no host call)
+        -> hybrid: use local decision if confident, else classifier
+        -> llm: classifier first, always
+        -> deterministic fallback (also the final answer for `capability`/`benchmark`)
       <- ModelRouteResponse(TargetKind: provider, Target, TargetModel)
     -> CLIProxyAPI executes selected provider/model
   <- Client response
@@ -34,6 +36,7 @@ internal/domain/
   config.go
   model.go
   policy.go
+  capability.go
 
 internal/application/
   router.go
@@ -46,6 +49,7 @@ internal/infrastructure/
   yaml_config.go
   state.go
   runtime_state.go
+  prompt.go
 ```
 
 ## `cmd/plugin`
@@ -124,15 +128,24 @@ Important types:
 
 ### `policy.go`
 
-Contains deterministic fallback policy.
+Contains deterministic, capability-aware candidate scoring used by every strategy's fallback path (and by `hybrid`'s local-first decision).
 
 Responsibilities:
 
 - Filter invalid candidates.
 - Respect available providers.
 - Estimate minimum required cost tier from simple prompt signals.
-- Apply `preference` during deterministic selection.
+- Gate eligible candidates by capabilities inferred from the prompt (see `capability.go`), when at least one configured candidate declares a matching capability.
+- Apply `preference` to rank the gated pool.
 - Apply conservative post-classifier preference tiebreaks.
+
+Key types and functions:
+
+- `RouteScore`: one scored candidate, with `MatchedCount`, `InferredCount`, `Reason`, and `LocalConfident()`.
+- `ScoreCandidates`: scores and sorts every eligible candidate for a prompt.
+- `SelectCandidateWithConfidence`: returns the top `RouteScore`.
+- `SelectCandidateForPrompt` / `SelectCandidate`: thin wrappers returning only the chosen `Candidate`, kept for simpler call sites that do not need confidence.
+- `ApplyPreferenceTiebreak`: unchanged conservative post-classifier tiebreak.
 
 Cost tiers:
 
@@ -150,21 +163,28 @@ Quality tiers:
 
 Unknown cost or quality values rank as `medium`.
 
+### `capability.go`
+
+Contains `InferCapabilities(prompt string) []string`, a small keyword-based matcher that maps prompt text to capability tags such as `coding`, `architecture`, `planning`, `summarize`, `translate`, `classify`, `tests`, `tools`, `agents`, `documentation`, `writing`, `review`, `refactor`, `reasoning`, `analysis`, and `long_context`.
+
+It intentionally returns an empty slice for ambiguous prompts. Callers must treat an empty result as "no local capability signal", not as "no capabilities apply".
+
 ## `internal/application`
 
 The application package contains use cases that coordinate domain logic and infrastructure contract types.
 
 ### `router.go`
 
-The `Router` use case handles deterministic route selection.
+The `Router` use case handles deterministic, capability-aware route selection.
 
 It:
 
 - Normalizes config.
 - Ignores requests that do not match `virtual_model`.
 - Converts configured models into domain candidates.
-- Calls domain selection policy.
-- Returns a `RouteDecision`.
+- Extracts the last user message via `infrastructure.ExtractUserPrompt` (the same prompt used by cache keys and the classifier).
+- Calls `domain.SelectCandidateWithConfidence`.
+- Returns a `RouteDecision`, including `Confident` for callers implementing local-first strategies.
 
 Classifier routing is not implemented here because classifier execution requires host callbacks. That host-aware behavior lives in `cmd/plugin/main.go`.
 
@@ -213,7 +233,7 @@ Runtime state may include:
 - usage aggregates
 - session route pins
 - route cache entries
-- counters
+- counters, including `router_local_confident` for hybrid local-first decisions
 
 Runtime state must not include:
 
@@ -223,6 +243,10 @@ Runtime state must not include:
 - credentials
 - API keys
 - auth records
+
+### `prompt.go`
+
+Extracts the last user message from OpenAI/Claude `messages` or Gemini `contents.parts` request bodies via `ExtractUserPrompt`. This is the single prompt-extraction implementation shared by cache keys, classifier input, and deterministic/local-first candidate scoring, so all three reason about the same text for a given request.
 
 ## Routing Pipeline
 
@@ -253,11 +277,30 @@ Cache behavior:
 
 If found, the route is reused and logged with `source: cache`.
 
-### 3. Classifier Route
+### 3. Local Capability-Aware Scoring
 
-Classifier routing is attempted only when:
+Every strategy computes a local, deterministic decision through `application.Router.Route`, which never makes a host call. This is the same decision used as the final answer for `capability`/`benchmark` and as the deterministic fallback for `llm`/`hybrid` on classifier failure.
 
-- `strategy` is `llm` or `hybrid`
+Local scoring:
+
+- extracts capabilities implied by the prompt via `domain.InferCapabilities` (a small keyword matcher, see `capability.go`);
+- filters eligible candidates by validity, available providers, and minimum cost tier for the prompt (same as before);
+- gates that pool to candidates declaring at least one inferred capability, when at least one configured candidate does so; otherwise the gate is a no-op;
+- ranks the gated pool by `preference` (unchanged tier logic).
+
+The result includes whether the decision is "locally confident": true only when the prompt matched a known capability signal and the winning candidate satisfies it. An ambiguous prompt, or a configuration with no matching `capabilities`, is never locally confident even though a candidate is still deterministically chosen.
+
+### 4. Strategy-Specific Use Of The Local Decision And Classifier
+
+- `capability` / `benchmark`: use the local decision directly. No classifier call.
+- `llm`: always calls the classifier first (see below), regardless of local confidence. Deterministic fallback (the same local decision) is used only if the classifier fails.
+- `hybrid`: local-first. If the local decision is confident, it is used directly and tagged `local_confident` in cache/debug reasons, skipping the classifier entirely. If not confident, the classifier is called exactly as in `llm`, with deterministic fallback on classifier failure.
+
+### 5. Classifier Route
+
+Classifier routing is attempted when:
+
+- `strategy` is `llm`, always; or `strategy` is `hybrid` and the local decision above was not confident
 - `classifier.enabled` is true
 - at least one classifier model is configured
 
@@ -288,9 +331,9 @@ Classifier failure cases:
 - selected model not found in configured `models`
 - selected model provider unavailable
 
-On failure, the next classifier is tried. If all attempts fail, deterministic fallback is used.
+On failure, the next classifier is tried. If all attempts fail, the local deterministic decision computed in step 3 is used.
 
-### 4. Preference Tiebreak
+### 6. Preference Tiebreak
 
 After a classifier selects a model, the plugin may apply a conservative preference tiebreak.
 
@@ -308,22 +351,6 @@ When a tiebreak changes the model, the route reason includes:
 preference_tiebreak:old-model->new-model
 ```
 
-### 5. Deterministic Fallback
-
-Deterministic fallback is always available for operational safety.
-
-It uses local configured metadata and simple text signals to choose an eligible model.
-
-Examples of current local prompt signals:
-
-- simple arithmetic/classification/summary can use `low` cost models
-- prompts containing `detalhes`, `como funciona`, `explique`, `código`, or `codigo` require at least `high` cost models
-
-Then `preference` affects ranking:
-
-- `quality`: highest quality first, cost as secondary tie-break
-- `cost` or `balanced`: lowest cost first, quality as secondary tie-break
-
 ## Strategy Semantics
 
 Supported strategy values:
@@ -335,12 +362,12 @@ Supported strategy values:
 
 Current implementation behavior:
 
-- `capability`: deterministic fallback only.
-- `benchmark`: currently behaves like deterministic fallback; benchmark fields are reserved metadata.
-- `llm`: classifier first, deterministic fallback on failure.
-- `hybrid`: same operational behavior as `llm` today.
+- `capability`: local capability-aware deterministic decision only. No classifier call.
+- `benchmark`: currently behaves like `capability`; benchmark fields are reserved metadata.
+- `llm`: classifier first on every request, local deterministic decision as fallback on classifier failure.
+- `hybrid`: local-first. Uses the local decision directly when it is confident (skipping the classifier); otherwise behaves like `llm` for that request.
 
-The plugin metadata exposes all four values, but deterministic fallback remains the safety path for every strategy.
+The plugin metadata exposes all four values, and the local deterministic decision remains the safety path for every strategy.
 
 ## Preference Semantics
 
@@ -452,6 +479,8 @@ Possible `source` values:
 - `selected`
 - `cache`
 - `session`
+
+When `strategy: hybrid` uses the local confident decision instead of calling the classifier, `source` is still `selected`, and `reason` is prefixed with `local_confident` so decision logs distinguish it from a classifier or plain deterministic-fallback selection.
 
 Classifier trace may include:
 

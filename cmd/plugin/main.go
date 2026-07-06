@@ -216,7 +216,16 @@ func routeModel(raw []byte) ([]byte, error) {
 	var trace *classifierTrace
 	var entry infrastructure.RouteCacheEntry
 	selected := false
-	if cfg.Strategy == "llm" || cfg.Strategy == "hybrid" {
+
+	router := application.Router{Config: cfg}
+	localDecision := router.Route(req.ModelRouteRequest)
+
+	switch cfg.Strategy {
+	case "llm":
+		// llm always tries the classifier first; deterministic fallback below
+		// covers classifier failure. This strategy intentionally pays classifier
+		// latency/cost on every uncached request in exchange for a classifier
+		// opinion on every decision.
 		classified, ok, classifier := classifyRoute(cfg, req.ModelRouteRequest)
 		trace = &classifier
 		if ok {
@@ -224,18 +233,47 @@ func routeModel(raw []byte) ([]byte, error) {
 			entry = classified
 			selected = true
 		}
+	case "hybrid":
+		// hybrid is local-first: local capability-aware scoring runs first (no
+		// host call), and the classifier is only consulted when the local
+		// decision is not confident (the prompt matched no known capability
+		// signal). This avoids paying classifier latency/cost for prompts the
+		// configured `models.capabilities` already answer clearly.
+		if localDecision.Handled && localDecision.Confident {
+			entry = routeCacheEntryFromDecision(localDecision, "local_confident")
+			selected = true
+			runtimeState.Inc("router_local_confident")
+		} else {
+			classified, ok, classifier := classifyRoute(cfg, req.ModelRouteRequest)
+			trace = &classifier
+			if ok {
+				classified = applyPreferenceTiebreak(cfg, req.ModelRouteRequest, classified)
+				entry = classified
+				selected = true
+			}
+		}
 	}
 	if !selected {
-		router := application.Router{Config: cfg}
-		decision := router.Route(req.ModelRouteRequest)
-		if !decision.Handled {
-			return infrastructure.OKEnvelope(infrastructure.ModelRouteResponse{Handled: false, Reason: decision.Reason})
+		if !localDecision.Handled {
+			return infrastructure.OKEnvelope(infrastructure.ModelRouteResponse{Handled: false, Reason: localDecision.Reason})
 		}
-		entry = infrastructure.RouteCacheEntry{Provider: decision.TargetProvider, Model: decision.TargetModel, Reason: decision.Reason, CreatedAt: time.Now()}
+		entry = routeCacheEntryFromDecision(localDecision, "")
 	}
 	storeRoute(cfg, req.ModelRouteRequest, entry)
 	logRouteDecision(cfg, req.ModelRouteRequest, entry, "selected", trace)
 	return routeResponse(entry, cfg, req.ModelRouteRequest)
+}
+
+// routeCacheEntryFromDecision converts a domain.RouteDecision into a cacheable
+// route entry, optionally prefixing the reason with a source tag such as
+// "local_confident" so debug logs and cache entries distinguish local-first
+// hybrid decisions from plain deterministic fallback.
+func routeCacheEntryFromDecision(decision domain.RouteDecision, sourceTag string) infrastructure.RouteCacheEntry {
+	reason := decision.Reason
+	if sourceTag != "" {
+		reason = sourceTag + " " + reason
+	}
+	return infrastructure.RouteCacheEntry{Provider: decision.TargetProvider, Model: decision.TargetModel, Reason: reason, CreatedAt: time.Now()}
 }
 
 func logRouteDecision(cfg domain.Config, req infrastructure.ModelRouteRequest, entry infrastructure.RouteCacheEntry, source string, classifier *classifierTrace) {
@@ -384,7 +422,7 @@ func storeRoute(cfg domain.Config, req infrastructure.ModelRouteRequest, entry i
 // routeCacheKey hashes the semantic prompt (last user message) so identical prompts
 // map to the same decision regardless of surrounding conversation history.
 func routeCacheKey(req infrastructure.ModelRouteRequest) string {
-	prompt := extractUserPrompt(req.Body)
+	prompt := infrastructure.ExtractUserPrompt(req.Body)
 	h := sha256.New()
 	h.Write([]byte(req.RequestedModel))
 	h.Write([]byte{0})
@@ -496,7 +534,7 @@ func classifierRequestBody(classifierModel string, cfg domain.Config, req infras
 		"deep reasoning go to high-quality models. " + preferenceInstruction(cfg.Preference) +
 		" Respond with ONLY a compact JSON object and nothing " +
 		"else: {\"selected_model\":\"<id>\",\"confidence\":<0-1>,\"reason\":\"<short>\"}."
-	userPrompt := extractUserPrompt(req.Body)
+	userPrompt := infrastructure.ExtractUserPrompt(req.Body)
 	userContent := fmt.Sprintf("Model catalog:\n%s\nUser request:\n%s", catalog.String(), truncateLogString(userPrompt, 4000))
 	payload := map[string]any{
 		"model":       classifierModel,
@@ -512,84 +550,6 @@ func classifierRequestBody(classifierModel string, cfg domain.Config, req infras
 		return []byte("{}")
 	}
 	return raw
-}
-
-// extractUserPrompt pulls readable user text from an OpenAI/Claude/Gemini request body
-// without forwarding the full original payload to the classifier.
-func extractUserPrompt(body []byte) string {
-	body = bytes.TrimSpace(body)
-	if len(body) == 0 {
-		return ""
-	}
-	var parsed struct {
-		Messages []struct {
-			Role    string          `json:"role"`
-			Content json.RawMessage `json:"content"`
-		} `json:"messages"`
-		Contents []struct {
-			Parts []struct {
-				Text string `json:"text"`
-			} `json:"parts"`
-		} `json:"contents"`
-	}
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return string(body)
-	}
-	var out strings.Builder
-	lastUser := ""
-	for _, msg := range parsed.Messages {
-		if msg.Role != "" && msg.Role != "user" {
-			continue
-		}
-		if text := strings.TrimSpace(contentToText(msg.Content)); text != "" {
-			lastUser = text
-		}
-	}
-	if lastUser != "" {
-		out.WriteString(lastUser)
-		out.WriteString("\n")
-	}
-	for _, c := range parsed.Contents {
-		for _, part := range c.Parts {
-			out.WriteString(part.Text)
-			out.WriteString("\n")
-		}
-	}
-	text := strings.TrimSpace(out.String())
-	if text == "" {
-		return string(body)
-	}
-	return text
-}
-
-// contentToText flattens OpenAI/Claude string-or-array message content into plain text.
-func contentToText(raw json.RawMessage) string {
-	raw = bytes.TrimSpace(raw)
-	if len(raw) == 0 {
-		return ""
-	}
-	if raw[0] == '"' {
-		var s string
-		if json.Unmarshal(raw, &s) == nil {
-			return s
-		}
-		return ""
-	}
-	var parts []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}
-	if json.Unmarshal(raw, &parts) == nil {
-		var out strings.Builder
-		for _, p := range parts {
-			if p.Text != "" {
-				out.WriteString(p.Text)
-				out.WriteString(" ")
-			}
-		}
-		return strings.TrimSpace(out.String())
-	}
-	return ""
 }
 
 // extractJSONObject returns the first balanced JSON object found in the content,
@@ -830,8 +790,8 @@ func pluginRegistration() registration {
 		SchemaVersion: infrastructure.SchemaVersion,
 		Metadata: infrastructure.Metadata{
 			Name:             pluginIdentifier,
-			Version:          "0.1.0",
-			Author:           "vfeitoza",
+			Version:          "0.1.1",
+			Author:           "Victor Feitoza",
 			GitHubRepository: "https://github.com/vfeitoza/cli-smart-router",
 			ConfigFields: []infrastructure.ConfigField{
 				{Name: "virtual_model", Type: infrastructure.ConfigFieldTypeString, Description: "Virtual model name intercepted by the router. Default: router:auto."},
