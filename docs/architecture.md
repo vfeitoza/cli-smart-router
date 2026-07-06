@@ -154,6 +154,8 @@ Cost tiers:
 - `high`
 - `very_high`
 
+The minimum cost tier estimator uses conservative keyword groups: simple summary/classification can stay `low`; scripts, SQL, documentation, and rewrites start at `medium`; planning, coding, debugging, tests, and reviews start at `high`; architecture, migration, monorepo, production, security, and critical work start at `very_high`.
+
 Quality tiers:
 
 - `low`

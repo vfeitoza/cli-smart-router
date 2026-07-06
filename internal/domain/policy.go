@@ -184,14 +184,47 @@ func containsString(list []string, value string) bool {
 
 func minimumCostForPrompt(prompt string) int {
 	prompt = strings.ToLower(prompt)
-	// ponytail: naive text signals; replace with classifier scoring if real traces demand it.
-	if strings.Contains(prompt, "2+3") || strings.Contains(prompt, "quanto é") || strings.Contains(prompt, "classifique") || strings.Contains(prompt, "resuma") {
-		return costRank("low")
+	// ponytail: keyword tiers keep deterministic fallback useful without building a rules engine.
+	if containsAny(prompt,
+		"arquitetura", "architecture", "system design", "design system",
+		"migração", "migracao", "migration", "monorepo",
+		"produção", "producao", "production",
+		"segurança", "seguranca", "security",
+		"critical", "crítica", "critica",
+	) {
+		return costRank("very_high")
 	}
-	if strings.Contains(prompt, "detalhes") || strings.Contains(prompt, "como funciona") || strings.Contains(prompt, "explique") || strings.Contains(prompt, "código") || strings.Contains(prompt, "codigo") {
+	if containsAny(prompt,
+		"plano", "planeje", "planejar", "planning", "strategy", "estratégia", "estrategia",
+		"detalhes", "details", "como funciona", "how does it work",
+		"explique", "explain", "analise", "analyze", "compare",
+		"código", "codigo", "code", "coding",
+		"implemente", "implement", "implementation",
+		"refatore", "refactor", "debug", "bug", "erro", "error",
+		"teste", "test", "review", "revisão", "revisao",
+	) {
 		return costRank("high")
 	}
+	if containsAny(prompt,
+		"script", "regex", "sql", "query",
+		"documente", "document", "documentation",
+		"formate", "format", "rewrite", "reword",
+	) {
+		return costRank("medium")
+	}
+	if containsAny(prompt, "2+3", "quanto é", "quanto e", "classifique", "classify", "resuma", "summarize", "traduza", "translate") {
+		return costRank("low")
+	}
 	return costRank("low")
+}
+
+func containsAny(text string, terms ...string) bool {
+	for _, term := range terms {
+		if strings.Contains(text, term) {
+			return true
+		}
+	}
+	return false
 }
 
 func costRank(cost string) int {

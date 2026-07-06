@@ -790,7 +790,7 @@ func pluginRegistration() registration {
 		SchemaVersion: infrastructure.SchemaVersion,
 		Metadata: infrastructure.Metadata{
 			Name:             pluginIdentifier,
-			Version:          "0.1.1",
+			Version:          "0.1.2",
 			Author:           "Victor Feitoza",
 			GitHubRepository: "https://github.com/vfeitoza/cli-smart-router",
 			ConfigFields: []infrastructure.ConfigField{

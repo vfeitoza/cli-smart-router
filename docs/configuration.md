@@ -695,8 +695,10 @@ The local decision selects an available configured candidate that is strong enou
 
 Current local signals for minimum cost tier:
 
-- Simple arithmetic/classification/summary requests can use `low` cost candidates.
-- Prompts containing signals such as `detalhes`, `como funciona`, `explique`, `código`, or `codigo` require at least `high` cost candidates.
+- Simple arithmetic/classification/summary/translation requests can use `low` cost candidates.
+- Script, SQL, regex, documentation, formatting, and rewrite requests require at least `medium` cost candidates.
+- Planning, strategy, explanation, analysis, coding, implementation, refactor, debug, test, and review requests require at least `high` cost candidates.
+- Architecture, system design, migration, monorepo, production, security, or critical requests require at least `very_high` cost candidates.
 
 Current local signals for capability gating (see `models[].capabilities` above for the full list): `resuma`/`summarize` implies `summarize`; `traduza`/`translate` implies `translate`; `classifique`/`classify` implies `classify`; `erro`/`bug`/`falha` implies `coding`/`review`; `refatora`/`refactor` implies `refactor`/`coding`; `arquitetura`/`design`/`planeje` implies `architecture`/`planning`; `explique`/`analise`/`compare` implies `reasoning`/`analysis`; `teste`/`coverage` implies `tests`/`coding`; `agente`/`ferramenta`/`tool` implies `agents`/`tools`; long prompts imply `long_context`.
 

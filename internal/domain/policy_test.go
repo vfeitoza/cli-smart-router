@@ -147,3 +147,23 @@ func TestScoreCandidatesNoCapabilitiesConfiguredFallsBackToTierRanking(t *testin
 		t.Fatalf("no-capabilities score = %#v, want LocalConfident() false (no inferred capability matched any candidate)", score)
 	}
 }
+
+func TestMinimumCostForPromptUsesTieredSignals(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		want string
+	}{
+		{name: "simple summary", text: "Resuma este texto", want: "low"},
+		{name: "script", text: "Crie um script SQL para listar usuarios", want: "medium"},
+		{name: "plan", text: "Crie um plano para implementar login", want: "high"},
+		{name: "critical architecture", text: "Planeje a arquitetura de uma migração de monorepo em produção", want: "very_high"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := minimumCostForPrompt(tt.text); got != costRank(tt.want) {
+				t.Fatalf("minimumCostForPrompt(%q) = %d, want %s", tt.text, got, tt.want)
+			}
+		})
+	}
+}

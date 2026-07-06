@@ -224,8 +224,10 @@ It must:
 
 Current prompt signals for minimum cost tier:
 
-- Simple arithmetic/classification/summary requests can use `low` cost models.
-- Prompts containing `detalhes`, `como funciona`, `explique`, `código`, or `codigo` require at least `high` cost models.
+- Simple arithmetic/classification/summary/translation requests can use `low` cost models.
+- Script, SQL, regex, documentation, formatting, and rewrite requests require at least `medium` cost models.
+- Planning, strategy, explanation, analysis, coding, implementation, refactor, debug, test, and review requests require at least `high` cost models.
+- Architecture, system design, migration, monorepo, production, security, or critical requests require at least `very_high` cost models.
 
 Current prompt signals for capability inference include: `resuma`/`summarize` implies `summarize`; `traduza`/`translate` implies `translate`; `classifique`/`classify` implies `classify`; `erro`/`bug`/`falha`/`exception` implies `coding`/`review`; `refatora`/`refactor` implies `refactor`/`coding`; `arquitetura`/`architecture`/`design`/`planeje` implies `architecture`/`planning`; `explique`/`explain`/`analise`/`compare` implies `reasoning`/`analysis`; `teste`/`unit test`/`coverage` implies `tests`/`coding`; `agente`/`agent`/`ferramenta`/`tool` implies `agents`/`tools`; `documenta`/`documentation` implies `documentation`/`writing`; `escreva`/`write` implies `writing`; `revis`/`review` implies `review`; prompts longer than roughly 1200 characters imply `long_context`.
 
