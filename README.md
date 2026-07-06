@@ -251,6 +251,49 @@ The route is exposed by CLIProxyAPI under `/v0/management/...` and requires the 
 
 The response includes runtime state snapshots for catalog, pricing, counters, cache, sessions, and usage. It never stores prompts, request bodies, credentials, API keys, or response bodies.
 
+## Live Verification Script
+
+Use the helper script to verify the plugin against a running CLIProxyAPI instance:
+
+```bash
+cp .env.example .env
+python3 scripts/check_smart_model_router.py --once
+```
+
+Required `.env` variables:
+
+```env
+BASE_URL=http://localhost:8317
+API_KEY="management-api-key"
+API_KEY_MODELS="models-api-key"
+```
+
+Authentication rules used by the script:
+
+- `/v0/...` management endpoints use `API_KEY`.
+- `/v1/...` model endpoints use `API_KEY_MODELS`.
+- Both keys are sent as `Authorization: Bearer <token>`.
+
+Default basic verification checks:
+
+- `GET /v0/management/plugins`
+- `GET /v1/models`
+- `GET /v0/management/plugins/smart-model-router/status`
+
+Run the full verification, including a non-streaming chat completion through the virtual model and a post-chat status read:
+
+```bash
+python3 scripts/check_smart_model_router.py --once --all
+```
+
+Avoid running `--all` in a tight loop unless you intentionally want to generate repeated model requests.
+
+Useful options:
+
+- `--base-url <url>` overrides `BASE_URL` from `.env`.
+- `--virtual-model <model>` overrides the default virtual model used by the check.
+- `--verbose` prints raw JSON responses in addition to the console summary.
+
 ## Debug Route Logs
 
 Enable non-sensitive JSONL route decision logs:

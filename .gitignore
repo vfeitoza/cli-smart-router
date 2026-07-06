@@ -4,6 +4,9 @@ dist/
 # temp dir
 tmp/
 
+# config
+.env
+
 # generated plugin artifacts
 smart-model-router.so
 smart-model-router.h
