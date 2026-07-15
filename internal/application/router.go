@@ -19,10 +19,7 @@ func (r Router) Route(req infrastructure.ModelRouteRequest) domain.RouteDecision
 	if !cfg.Enabled || strings.TrimSpace(req.RequestedModel) != cfg.VirtualModel {
 		return domain.RouteDecision{Handled: false}
 	}
-	candidates := make([]domain.Candidate, 0, len(cfg.Models))
-	for _, item := range cfg.Models {
-		candidates = append(candidates, domain.CandidateFromConfig(item))
-	}
+	candidates := cfg.Candidates()
 	prompt := infrastructure.ExtractUserPrompt(req.Body)
 	score, ok := domain.SelectCandidateWithConfidence(candidates, req.AvailableProviders, prompt, cfg.Preference)
 	if !ok {

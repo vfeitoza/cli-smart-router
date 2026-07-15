@@ -110,6 +110,21 @@ type classifierTrace struct {
 	Error    string `json:"error,omitempty"`
 }
 
+// decisionTrace captures the Decision Engine's observability for one routed
+// request: the detected task, language, complexity score, which policy fired,
+// the chosen model, the reason, and how long the decision took.
+type decisionTrace struct {
+	Task            string `json:"task"`
+	Language        string `json:"language,omitempty"`
+	ComplexityScore int    `json:"complexity_score"`
+	Policy          string `json:"policy"`
+	Model           string `json:"model,omitempty"`
+	Provider        string `json:"provider,omitempty"`
+	Reason          string `json:"reason,omitempty"`
+	DecisionMicros  int64  `json:"decision_micros"`
+	DecisionTime    string `json:"decision_time,omitempty"`
+}
+
 func main() {}
 
 //export cliproxy_plugin_init
@@ -205,15 +220,16 @@ func routeModel(raw []byte) ([]byte, error) {
 	runtimeState.Inc("router_requests_total")
 	refreshExternalState(cfg)
 	if sessionEntry, ok := sessionRoute(cfg, req.ModelRouteRequest); ok {
-		logRouteDecision(cfg, req.ModelRouteRequest, sessionEntry, "session", nil)
+		logRouteDecision(cfg, req.ModelRouteRequest, sessionEntry, "session", nil, nil)
 		return routeResponse(sessionEntry, cfg, req.ModelRouteRequest)
 	}
 	if cachedEntry, ok := cachedRoute(cfg, req.ModelRouteRequest); ok {
 		runtimeState.Inc("router_cache_hits")
-		logRouteDecision(cfg, req.ModelRouteRequest, cachedEntry, "cache", nil)
+		logRouteDecision(cfg, req.ModelRouteRequest, cachedEntry, "cache", nil, nil)
 		return routeResponse(cachedEntry, cfg, req.ModelRouteRequest)
 	}
 	var trace *classifierTrace
+	var dTrace *decisionTrace
 	var entry infrastructure.RouteCacheEntry
 	selected := false
 
@@ -226,13 +242,7 @@ func routeModel(raw []byte) ([]byte, error) {
 		// covers classifier failure. This strategy intentionally pays classifier
 		// latency/cost on every uncached request in exchange for a classifier
 		// opinion on every decision.
-		classified, ok, classifier := classifyRoute(cfg, req.ModelRouteRequest)
-		trace = &classifier
-		if ok {
-			classified = applyPreferenceTiebreak(cfg, req.ModelRouteRequest, classified)
-			entry = classified
-			selected = true
-		}
+		entry, trace, selected = classifyAndSelect(cfg, req.ModelRouteRequest)
 	case "hybrid":
 		// hybrid is local-first: local capability-aware scoring runs first (no
 		// host call), and the classifier is only consulted when the local
@@ -244,14 +254,22 @@ func routeModel(raw []byte) ([]byte, error) {
 			selected = true
 			runtimeState.Inc("router_local_confident")
 		} else {
-			classified, ok, classifier := classifyRoute(cfg, req.ModelRouteRequest)
-			trace = &classifier
-			if ok {
-				classified = applyPreferenceTiebreak(cfg, req.ModelRouteRequest, classified)
-				entry = classified
-				selected = true
-			}
+			entry, trace, selected = classifyAndSelect(cfg, req.ModelRouteRequest)
 		}
+	case "decision_engine":
+		// decision_engine runs the full rules pipeline: Prompt -> Context ->
+		// Complexity -> Policy Engine -> Router. The Policy Engine decides; the
+		// Router only forwards. When no rule matches (or the target cannot be
+		// located), it falls through to the deterministic local decision below,
+		// preserving full backward compatibility.
+		decision, engineTrace, ok := decisionEngineRoute(cfg, req.ModelRouteRequest)
+		dTrace = &engineTrace
+		if ok {
+			entry = routeCacheEntryFromDecision(decision, "")
+			selected = true
+			runtimeState.Inc("router_decision_engine")
+		}
+		runtimeState.SetLastDecision(decisionSnapshotFromTrace(engineTrace, ok))
 	}
 	if !selected {
 		if !localDecision.Handled {
@@ -260,7 +278,7 @@ func routeModel(raw []byte) ([]byte, error) {
 		entry = routeCacheEntryFromDecision(localDecision, "")
 	}
 	storeRoute(cfg, req.ModelRouteRequest, entry)
-	logRouteDecision(cfg, req.ModelRouteRequest, entry, "selected", trace)
+	logRouteDecision(cfg, req.ModelRouteRequest, entry, "selected", trace, dTrace)
 	return routeResponse(entry, cfg, req.ModelRouteRequest)
 }
 
@@ -276,7 +294,117 @@ func routeCacheEntryFromDecision(decision domain.RouteDecision, sourceTag string
 	return infrastructure.RouteCacheEntry{Provider: decision.TargetProvider, Model: decision.TargetModel, Reason: reason, CreatedAt: time.Now()}
 }
 
-func logRouteDecision(cfg domain.Config, req infrastructure.ModelRouteRequest, entry infrastructure.RouteCacheEntry, source string, classifier *classifierTrace) {
+// decisionEngineRoute runs the full Decision Engine pipeline for one request:
+// Prompt Analyzer -> Context Analyzer -> Complexity Analyzer -> Policy Engine ->
+// Router. The Policy Engine decides which model to use; the Router only locates
+// the provider and forwards. It returns ok=false when no rule matches or the
+// decided target cannot be located, so the caller falls back to deterministic
+// routing. The ranked policy chain is cached so the executor path can apply the
+// Fallback Engine (next allowed model) on provider failures. A decisionTrace is
+// always returned for observability (task, language, score, policy, model,
+// reason, decision time), even when the pipeline abstains.
+func decisionEngineRoute(cfg domain.Config, req infrastructure.ModelRouteRequest) (domain.RouteDecision, decisionTrace, bool) {
+	start := time.Now()
+	facts := buildRouteFacts(cfg, req)
+	trace := decisionTrace{
+		Task:            facts.Task.String(),
+		Language:        facts.Language,
+		ComplexityScore: facts.ComplexityScore,
+		Policy:          "none",
+	}
+	finish := func() {
+		trace.DecisionMicros = time.Since(start).Microseconds()
+		trace.DecisionTime = time.Since(start).String()
+	}
+
+	chain := domain.EvaluateRoutesRanked(cfg.Routes, facts, cfg.Candidates(), req.AvailableProviders)
+	if len(chain) == 0 {
+		finish()
+		return domain.RouteDecision{}, trace, false
+	}
+	router := application.PolicyRouter{Config: cfg}
+	decision := router.Forward(chain[0], req.AvailableProviders)
+	if !decision.Handled {
+		finish()
+		return domain.RouteDecision{}, trace, false
+	}
+	storeFallbackChain(cfg, req, chain)
+	trace.Policy = policyLabel(cfg, chain[0])
+	trace.Provider = decision.TargetProvider
+	trace.Model = decision.TargetModel
+	trace.Reason = decision.Reason
+	finish()
+	return decision, trace, true
+}
+
+// policyLabel builds a human-readable identifier of the rule that decided the
+// route, e.g. "rule#2" plus the matched conditions from the Policy Engine reason.
+func policyLabel(cfg domain.Config, decision domain.PolicyDecision) string {
+	label := fmt.Sprintf("rule#%d", decision.RuleIndex)
+	if decision.Reason != "" {
+		label += " " + decision.Reason
+	}
+	return label
+}
+
+// decisionSnapshotFromTrace converts the in-request decisionTrace into the
+// non-sensitive snapshot persisted in runtime state for the status endpoint.
+func decisionSnapshotFromTrace(trace decisionTrace, matched bool) infrastructure.DecisionSnapshot {
+	return infrastructure.DecisionSnapshot{
+		Task:           trace.Task,
+		Language:       trace.Language,
+		Score:          trace.ComplexityScore,
+		Policy:         trace.Policy,
+		Provider:       trace.Provider,
+		Model:          trace.Model,
+		Reason:         trace.Reason,
+		Matched:        matched,
+		DecisionTimeUS: trace.DecisionMicros,
+		At:             time.Now(),
+	}
+}
+
+// buildRouteFacts assembles the Policy Engine facts from the analyzer layers
+// without forwarding the full request body downstream.
+func buildRouteFacts(cfg domain.Config, req infrastructure.ModelRouteRequest) domain.RouteFacts {
+	prompt := infrastructure.ExtractUserPrompt(req.Body)
+	ctx := domain.AnalyzeContext(domain.ContextInput{
+		Prompt:       prompt,
+		Body:         string(req.Body),
+		HistoryTurns: 0,
+	})
+	complexity := domain.AssessComplexity(domain.ComplexityInputFromSignals(prompt, ctx, nil, 0))
+	return domain.RouteFacts{
+		Task:            domain.DetectIntent(prompt),
+		Language:        ctx.Language,
+		ComplexityScore: complexity.Score,
+		ComplexityTier:  complexity.MinCostTier,
+		FileCount:       ctx.FileCount,
+		HasDiff:         ctx.DiffSize > 0,
+		Stream:          req.Stream,
+	}
+}
+
+// storeFallbackChain caches the ordered policy-allowed targets for a request so the
+// executor path can walk them via the Fallback Engine when a provider fails.
+func storeFallbackChain(cfg domain.Config, req infrastructure.ModelRouteRequest, chain []domain.PolicyDecision) {
+	if len(chain) == 0 {
+		return
+	}
+	sessionID := metadataString(req.Metadata, "execution_session_id")
+	if sessionID == "" {
+		return
+	}
+	models := make([]string, 0, len(chain))
+	providers := make([]string, 0, len(chain))
+	for _, decision := range chain {
+		models = append(models, decision.Model)
+		providers = append(providers, decision.Provider)
+	}
+	runtimeState.SetFallbackChain(sessionID, providers, models)
+}
+
+func logRouteDecision(cfg domain.Config, req infrastructure.ModelRouteRequest, entry infrastructure.RouteCacheEntry, source string, classifier *classifierTrace, decision *decisionTrace) {
 	if !cfg.Debug.Enabled || strings.TrimSpace(cfg.Debug.LogPath) == "" {
 		return
 	}
@@ -294,6 +422,9 @@ func logRouteDecision(cfg domain.Config, req infrastructure.ModelRouteRequest, e
 	}
 	if classifier != nil {
 		record["classifier"] = classifier
+	}
+	if decision != nil {
+		record["decision"] = decision
 	}
 	raw, err := json.Marshal(record)
 	if err != nil {
@@ -438,6 +569,17 @@ func cacheTTL(cfg domain.Config) time.Duration {
 	return 0
 }
 
+// classifyAndSelect runs the classifier and, on success, applies the preference
+// tiebreak, returning the chosen entry plus its trace. It is the shared body of
+// the llm and hybrid strategies so both consult the classifier identically.
+func classifyAndSelect(cfg domain.Config, req infrastructure.ModelRouteRequest) (infrastructure.RouteCacheEntry, *classifierTrace, bool) {
+	classified, ok, classifier := classifyRoute(cfg, req)
+	if ok {
+		classified = applyPreferenceTiebreak(cfg, req, classified)
+	}
+	return classified, &classifier, ok
+}
+
 func classifyRoute(cfg domain.Config, req infrastructure.ModelRouteRequest) (infrastructure.RouteCacheEntry, bool, classifierTrace) {
 	trace := classifierTrace{Enabled: cfg.Classifier.Enabled}
 	if !cfg.Classifier.Enabled || len(cfg.Classifier.Models) == 0 {
@@ -483,7 +625,7 @@ func classifyRoute(cfg domain.Config, req infrastructure.ModelRouteRequest) (inf
 			continue
 		}
 		candidate, ok := candidates[parsed.SelectedModel]
-		if !ok || !providerAvailable(candidate.Provider, req.AvailableProviders) {
+		if !ok || !domain.ProviderAvailable(candidate.Provider, req.AvailableProviders) {
 			runtimeState.Inc("router_classifier_failures")
 			trace.Error = "classifier selected unavailable model: " + parsed.SelectedModel
 			continue
@@ -621,11 +763,7 @@ func applyPreferenceTiebreak(cfg domain.Config, req infrastructure.ModelRouteReq
 	if !ok {
 		return entry
 	}
-	candidates := make([]domain.Candidate, 0, len(cfg.Models))
-	for _, item := range cfg.Models {
-		candidates = append(candidates, domain.CandidateFromConfig(item))
-	}
-	promoted := domain.ApplyPreferenceTiebreak(domain.CandidateFromConfig(chosen), candidates, req.AvailableProviders, cfg.Preference)
+	promoted := domain.ApplyPreferenceTiebreak(domain.CandidateFromConfig(chosen), cfg.Candidates(), req.AvailableProviders, cfg.Preference)
 	if promoted.Model == entry.Model {
 		return entry
 	}
@@ -643,19 +781,6 @@ func configuredCandidateSet(cfg domain.Config) map[string]domain.CandidateConfig
 		}
 	}
 	return out
-}
-
-func providerAvailable(provider string, available []string) bool {
-	if len(available) == 0 {
-		return true
-	}
-	provider = strings.ToLower(strings.TrimSpace(provider))
-	for _, item := range available {
-		if strings.ToLower(strings.TrimSpace(item)) == provider {
-			return true
-		}
-	}
-	return false
 }
 
 func metadataString(meta map[string]any, key string) string {
@@ -689,25 +814,29 @@ func executeWithFallback(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	cfg := configStore.Load()
-	maxAttempts := cfg.ExecutorFallback.MaxAttempts
-	if maxAttempts <= 0 || maxAttempts > len(cfg.Models) {
-		maxAttempts = len(cfg.Models)
+
+	// Prefer the policy-allowed fallback chain from the Decision Engine when the
+	// request carries a session with a cached chain; otherwise fall back to the
+	// configured model order (legacy behavior).
+	providers, models := executorCandidateChain(cfg, req)
+
+	requestBody := req.OriginalRequest
+	if len(requestBody) == 0 {
+		requestBody = req.Payload
 	}
+	failed := map[string]struct{}{}
 	var lastErr error
-	for i := 0; i < maxAttempts; i++ {
-		candidate := cfg.Models[i]
-		if candidate.Model == "" {
+	for attempt := 0; attempt < len(models); attempt++ {
+		provider := providers[attempt]
+		model := models[attempt]
+		if model == "" {
 			continue
-		}
-		requestBody := req.OriginalRequest
-		if len(requestBody) == 0 {
-			requestBody = req.Payload
 		}
 		resp, err := callHost[infrastructure.HostModelExecutionResponse](infrastructure.MethodHostModelExecute, infrastructure.HostModelExecutionRPCRequest{
 			HostModelExecutionRequest: infrastructure.HostModelExecutionRequest{
 				EntryProtocol: req.SourceFormat,
 				ExitProtocol:  req.SourceFormat,
-				Model:         candidate.Model,
+				Model:         model,
 				Stream:        false,
 				Body:          requestBody,
 				Headers:       req.Headers,
@@ -716,19 +845,54 @@ func executeWithFallback(raw []byte) ([]byte, error) {
 			},
 			HostCallbackID: req.HostCallbackID,
 		})
+		outcome := domain.AttemptOutcome{}
 		if err != nil {
-			lastErr = err
-			continue
+			outcome.Err = err.Error()
+		} else {
+			outcome.StatusCode = resp.StatusCode
 		}
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		reason := domain.ClassifyFailure(outcome)
+		if !reason.Fallbackable() {
 			return infrastructure.OKEnvelope(infrastructure.ExecutorResponse{Payload: resp.Body, Headers: resp.Headers})
 		}
-		lastErr = fmt.Errorf("candidate %s returned status %d", candidate.Model, resp.StatusCode)
+		// Fallback Engine: record the failed model and continue to the next
+		// policy-allowed candidate for timeout, HTTP error, context exceeded,
+		// token limit, or unavailability.
+		domain.MarkFailed(failed, provider, model)
+		runtimeState.Inc("router_fallback_" + string(reason))
+		if err != nil {
+			lastErr = err
+		} else {
+			lastErr = fmt.Errorf("candidate %s failed: %s (status %d)", model, reason, resp.StatusCode)
+		}
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("no executor fallback candidate available")
 	}
 	return infrastructure.ErrorEnvelope("executor_fallback_failed", lastErr.Error()), nil
+}
+
+// executorCandidateChain returns the ordered provider/model pairs the executor
+// should try. It uses the Decision Engine's cached policy chain for the request's
+// session when present; otherwise it uses the configured model order, capped by
+// executor_fallback.max_attempts (legacy behavior).
+func executorCandidateChain(cfg domain.Config, req infrastructure.ExecutorRPCRequest) ([]string, []string) {
+	if sessionID := metadataString(req.Metadata, "execution_session_id"); sessionID != "" {
+		if chain, ok := runtimeState.GetFallbackChain(sessionID); ok {
+			return chain.Providers, chain.Models
+		}
+	}
+	maxAttempts := cfg.ExecutorFallback.MaxAttempts
+	if maxAttempts <= 0 || maxAttempts > len(cfg.Models) {
+		maxAttempts = len(cfg.Models)
+	}
+	providers := make([]string, 0, maxAttempts)
+	models := make([]string, 0, maxAttempts)
+	for i := 0; i < maxAttempts; i++ {
+		providers = append(providers, cfg.Models[i].Provider)
+		models = append(models, cfg.Models[i].Model)
+	}
+	return providers, models
 }
 
 func managementRegister() ([]byte, error) {
@@ -755,12 +919,14 @@ func managementHandle(raw []byte) ([]byte, error) {
 			Body:       []byte(`{"error":"not_found"}`),
 		})
 	}
+	snapshot := runtimeState.Snapshot()
 	body, errMarshal := json.Marshal(map[string]any{
 		"plugin":        pluginIdentifier,
 		"virtual_model": configStore.Load().VirtualModel,
 		"strategy":      configStore.Load().Strategy,
 		"usage":         usageLearner.Snapshot(),
-		"state":         runtimeState.Snapshot(),
+		"last_decision": snapshot.LastDecision,
+		"state":         snapshot,
 	})
 	if errMarshal != nil {
 		return nil, errMarshal
@@ -795,7 +961,7 @@ func pluginRegistration() registration {
 			GitHubRepository: "https://github.com/vfeitoza/cli-smart-router",
 			ConfigFields: []infrastructure.ConfigField{
 				{Name: "virtual_model", Type: infrastructure.ConfigFieldTypeString, Description: "Virtual model name intercepted by the router. Default: router:auto."},
-				{Name: "strategy", Type: infrastructure.ConfigFieldTypeEnum, EnumValues: []string{"capability", "benchmark", "llm", "hybrid"}, Description: "Routing strategy. V1 uses deterministic capability routing."},
+				{Name: "strategy", Type: infrastructure.ConfigFieldTypeEnum, EnumValues: []string{"capability", "benchmark", "llm", "hybrid", "decision_engine"}, Description: "Routing strategy. V1 uses deterministic capability routing."},
 				{Name: "debug", Type: infrastructure.ConfigFieldTypeObject, Description: "Optional non-sensitive route decision JSONL logging settings."},
 				{Name: "catalog", Type: infrastructure.ConfigFieldTypeObject, Description: "Catalog refresh settings for CLIProxyAPI /v1/models."},
 				{Name: "pricing", Type: infrastructure.ConfigFieldTypeObject, Description: "Optional external pricing refresh settings."},

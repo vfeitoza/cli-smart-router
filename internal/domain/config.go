@@ -34,7 +34,40 @@ type Config struct {
 	ExecutorFallback ExecutorFallbackConfig `yaml:"executor_fallback"`
 	Classifier       ClassifierConfig       `yaml:"classifier"`
 	Routing          RoutingConfig          `yaml:"routing"`
+	Routes           []RouteRule            `yaml:"routes"`
 	Models           []CandidateConfig      `yaml:"models"`
+}
+
+// RouteRule is one declarative routing rule read from config `routes:`. When the
+// `when` conditions all match the current request facts, the Policy Engine routes
+// to `model` (and optionally `provider`). Rules are matched by specificity, so
+// unset conditions are treated as wildcards. Absent `routes:` keeps legacy behavior.
+type RouteRule struct {
+	When  RouteCondition `yaml:"when"`
+	Model string         `yaml:"model"`
+	// Provider disambiguates when the same model id exists under multiple providers.
+	Provider string `yaml:"provider"`
+}
+
+// RouteCondition is the `when` block of a RouteRule. Every field is optional; an
+// empty field is a wildcard that matches anything. This keeps rules terse and
+// avoids scattered conditionals: the Policy Engine evaluates them table-driven.
+type RouteCondition struct {
+	// Task matches the detected Intent (e.g. coding, review, security).
+	Task string `yaml:"task"`
+	// Language matches the detected programming language (e.g. go, python).
+	Language string `yaml:"language"`
+	// Complexity matches a coarse bucket: low, medium, high, very_high.
+	Complexity string `yaml:"complexity"`
+	// ComplexityMin/Max match the numeric complexity score range [0,100].
+	ComplexityMin *int `yaml:"complexity_min"`
+	ComplexityMax *int `yaml:"complexity_max"`
+	// MinFiles matches when the request references at least this many files.
+	MinFiles *int `yaml:"min_files"`
+	// HasDiff, when set, matches only requests that do (true) or do not (false) carry a diff.
+	HasDiff *bool `yaml:"has_diff"`
+	// Stream, when set, matches only streaming (true) or non-streaming (false) requests.
+	Stream *bool `yaml:"stream"`
 }
 
 // DebugConfig controls non-sensitive route decision logs.
@@ -173,10 +206,28 @@ func (c Config) Normalize() Config {
 		c.Models[i].Cost = strings.ToLower(strings.TrimSpace(c.Models[i].Cost))
 		c.Models[i].Quality = strings.ToLower(strings.TrimSpace(c.Models[i].Quality))
 	}
+	for i := range c.Routes {
+		c.Routes[i].Model = strings.TrimSpace(c.Routes[i].Model)
+		c.Routes[i].Provider = strings.ToLower(strings.TrimSpace(c.Routes[i].Provider))
+		c.Routes[i].When.Task = strings.ToLower(strings.TrimSpace(c.Routes[i].When.Task))
+		c.Routes[i].When.Language = strings.ToLower(strings.TrimSpace(c.Routes[i].When.Language))
+		c.Routes[i].When.Complexity = strings.ToLower(strings.TrimSpace(c.Routes[i].When.Complexity))
+	}
 	return c
 }
 
 // EnabledForRouting reports whether the plugin should handle route requests.
 func (c Config) EnabledForRouting() bool {
 	return c.Normalize().Enabled
+}
+
+// Candidates converts the configured models into normalized routing candidates.
+// It is the single conversion shared by the Router, Policy Engine wiring, and
+// preference tiebreak so no caller re-implements the models -> candidates loop.
+func (c Config) Candidates() []Candidate {
+	out := make([]Candidate, 0, len(c.Models))
+	for _, item := range c.Models {
+		out = append(out, CandidateFromConfig(item))
+	}
+	return out
 }

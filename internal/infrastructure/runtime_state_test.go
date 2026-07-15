@@ -5,6 +5,32 @@ import (
 	"time"
 )
 
+func TestRuntimeStateLastDecisionSnapshot(t *testing.T) {
+	state := NewRuntimeState()
+	if snap := state.Snapshot(); snap.LastDecision != nil {
+		t.Fatalf("expected no decision initially, got %#v", snap.LastDecision)
+	}
+	state.SetLastDecision(DecisionSnapshot{
+		Task:           "coding",
+		Language:       "go",
+		Score:          42,
+		Policy:         "rule#1 task=coding language=go",
+		Provider:       "codex",
+		Model:          "gpt-5.4-mini",
+		Reason:         "matched",
+		Matched:        true,
+		DecisionTimeUS: 128,
+	})
+	snap := state.Snapshot()
+	if snap.LastDecision == nil {
+		t.Fatal("expected last decision to be set")
+	}
+	got := snap.LastDecision
+	if got.Task != "coding" || got.Language != "go" || got.Score != 42 || got.Model != "gpt-5.4-mini" || !got.Matched || got.DecisionTimeUS != 128 {
+		t.Fatalf("unexpected snapshot = %#v", got)
+	}
+}
+
 func TestRuntimeStateCacheAndSession(t *testing.T) {
 	state := NewRuntimeState()
 	entry := RouteCacheEntry{Provider: "codex", Model: "gpt-5.4-mini", Reason: "test"}
@@ -61,5 +87,23 @@ func TestRuntimeStatePersistsNonSensitiveData(t *testing.T) {
 	snapshot := loaded.Snapshot()
 	if len(snapshot.Catalog.Models) != 1 || snapshot.Pricing.Bytes != 123 || snapshot.Usage["codex/gpt-5.4-mini"].TotalTokens != 7 {
 		t.Fatalf("loaded snapshot = %#v", snapshot)
+	}
+}
+
+func TestRuntimeStateFallbackChain(t *testing.T) {
+	state := NewRuntimeState()
+	if _, ok := state.GetFallbackChain("s1"); ok {
+		t.Fatalf("expected no chain initially")
+	}
+	state.SetFallbackChain("s1", []string{"codex", "claude"}, []string{"gpt-5.4-mini", "claude-sonnet-5"})
+	chain, ok := state.GetFallbackChain("s1")
+	if !ok || len(chain.Models) != 2 {
+		t.Fatalf("expected stored chain, got %+v ok=%v", chain, ok)
+	}
+	if chain.Providers[1] != "claude" || chain.Models[0] != "gpt-5.4-mini" {
+		t.Fatalf("unexpected chain contents: %+v", chain)
+	}
+	if _, ok := state.GetFallbackChain(""); ok {
+		t.Fatalf("expected empty session id to return no chain")
 	}
 }

@@ -27,6 +27,33 @@ func (c Candidate) Valid() bool {
 	return strings.TrimSpace(c.Provider) != "" && strings.TrimSpace(c.Model) != ""
 }
 
+// AvailableSet builds a lookup of lowercased, trimmed provider names. An empty
+// input yields an empty set, which callers treat as "no restriction". It is the
+// single availability-set builder shared by the Policy Engine and Router so
+// provider-availability checks stay identical across layers.
+func AvailableSet(providers []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(providers))
+	for _, provider := range providers {
+		provider = strings.ToLower(strings.TrimSpace(provider))
+		if provider != "" {
+			set[provider] = struct{}{}
+		}
+	}
+	return set
+}
+
+// ProviderAvailable reports whether provider is in the available list. An empty
+// list means no restriction (everything is available).
+func ProviderAvailable(provider string, available []string) bool {
+	if len(available) == 0 {
+		return true
+	}
+	if _, ok := AvailableSet(available)[strings.ToLower(strings.TrimSpace(provider))]; ok {
+		return true
+	}
+	return false
+}
+
 // RouteDecision is the domain result of a routing use case.
 type RouteDecision struct {
 	Handled        bool
