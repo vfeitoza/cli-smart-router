@@ -1,0 +1,246 @@
+# Suggested CLIProxyAPI configuration for the complete candidate catalog.
+# Provider mappings follow the local CLIProxyAPI setup:
+# - claude: Anthropic/Claude
+# - codex: OpenAI/Codex GPT models
+# - openai: OpenAI-compatible models (GLM and Kimi)
+# - antigravity: Gemini
+plugins:
+  enabled: true
+  dir: plugins
+  configs:
+    smart-model-router:
+      enabled: true
+      priority: 100
+      virtual_model: router:auto
+
+      # routes is evaluated only by decision_engine.
+      strategy: decision_engine
+      preference: balanced
+      state_path: smart-model-router-state.json
+
+      debug:
+        enabled: false
+        log_path: smart-model-router-decisions.jsonl
+
+      catalog:
+        source: cli_proxy_api
+        base_url: http://127.0.0.1:8317
+        api_key: ""
+        refresh_interval: 10m
+        include_router_model: false
+
+      pricing:
+        enabled: true
+        url: https://raw.githubusercontent.com/ENTERPILOT/ai-model-price-list/refs/heads/main/sources/llm_prices_current.json
+        refresh_interval: 6h
+
+      cache:
+        enabled: true
+        max_entries: 1024
+        ttl: 24h
+
+      # Keep false unless non-streaming same-request retry is required.
+      executor_fallback:
+        enabled: false
+        max_attempts: 3
+
+      # decision_engine never calls a classifier.
+      classifier:
+        enabled: false
+
+      routing:
+        prefer_low_cost: true
+        prefer_low_latency: false
+        prefer_high_quality: true
+        max_cost_per_request: 0.05
+        max_input_tokens: 100000
+        # Evaluate the policy on every request. Session affinity would reuse the
+        # first route before the Decision Engine sees a later task.
+        keep_same_model_per_session: false
+        allow_fallback: true
+        switch_threshold: 0.15
+        benchmark_weight: 0.4
+        llm_router_weight: 0.3
+        capability_weight: 0.3
+
+      # Rules use the eight intents detected by the local Prompt Analyzer.
+      # More conditions win; equal specificity preserves this declaration order.
+      routes:
+        # Security is deliberately pinned to the strongest reasoning model.
+        - when:
+            task: security
+          provider: claude
+          model: claude-opus-4-8
+
+        # Architecture and large plans need the strongest long-form reasoning.
+        - when:
+            task: planning
+            complexity_min: 50
+          provider: claude
+          model: claude-opus-4-8
+        - when:
+            task: planning
+            complexity: medium
+          provider: openai
+          model: glm-5.2
+        - when:
+            task: planning
+          provider: codex
+          model: gpt-5.6-sol
+
+        # Cross-file changes with a diff get a proven high-capability coding path.
+        - when:
+            task: coding
+            min_files: 4
+            has_diff: true
+          provider: claude
+          model: claude-sonnet-5
+        - when:
+            task: coding
+            complexity_min: 50
+          provider: codex
+          model: gpt-5.6-terra
+        - when:
+            task: coding
+          provider: openai
+          model: kimi-k2.7-code
+
+        # Reviews, tests, and debugging benefit from the same stronger code path
+        # once context size or repository scope makes the request complex.
+        - when:
+            task: review
+            complexity_min: 50
+          provider: claude
+          model: claude-sonnet-5
+        - when:
+            task: review
+          provider: codex
+          model: gpt-5.6-terra
+        - when:
+            task: testing
+            complexity_min: 50
+          provider: codex
+          model: gpt-5.6-terra
+        - when:
+            task: testing
+          provider: openai
+          model: kimi-k2.7-code
+        - when:
+            task: debug
+            complexity_min: 50
+          provider: codex
+          model: gpt-5.6-terra
+        - when:
+            task: debug
+          provider: openai
+          model: kimi-k2.7-code
+
+        # Complex performance work is often cross-cutting; smaller investigations
+        # use the faster general-purpose route.
+        - when:
+            task: performance
+            complexity_min: 50
+          provider: claude
+          model: claude-sonnet-5
+        - when:
+            task: performance
+          provider: codex
+          model: gpt-5.6-luna
+
+        # Documentation uses cheaper, faster models unless the context is substantial.
+        - when:
+            task: documentation
+            complexity_min: 25
+          provider: codex
+          model: gpt-5.6-luna
+        - when:
+            task: documentation
+            language: markdown
+            complexity: low
+          provider: antigravity
+          model: gemini-3.1-flash-lite
+        - when:
+            task: documentation
+            complexity: low
+          provider: claude
+          model: claude-haiku-4-5
+        - when:
+            task: documentation
+          provider: antigravity
+          model: gemini-3-flash
+
+        # Conservative route for unclassified, trivial requests. No catch-all is
+        # intentional: unknown substantive work falls back to local capability routing.
+        - when:
+            complexity: low
+          provider: codex
+          model: gpt-5.4-mini
+
+      # Authoritative provider/model matrix. Cost and quality are routing policy
+      # inputs: calibrate them from your actual latency, quality, and billing data.
+      models:
+        - provider: claude
+          model: claude-opus-4-8
+          capabilities: [reasoning, architecture, planning, security, analysis, writing, long_context]
+          cost: very_high
+          quality: highest
+
+        - provider: claude
+          model: claude-sonnet-5
+          capabilities: [coding, reasoning, review, testing, debug, performance, refactor, tools, architecture, writing]
+          cost: high
+          quality: high
+
+        - provider: claude
+          model: claude-haiku-4-5
+          capabilities: [documentation, summarize, translate, classify, fast, low_cost, routing]
+          cost: low
+          quality: medium
+
+        - provider: codex
+          model: gpt-5.6-sol
+          capabilities: [reasoning, planning, analysis, architecture, writing, long_context]
+          cost: very_high
+          quality: highest
+
+        - provider: codex
+          model: gpt-5.6-terra
+          capabilities: [coding, reasoning, review, testing, debug, refactor, tools, repository]
+          cost: high
+          quality: highest
+
+        - provider: codex
+          model: gpt-5.6-luna
+          capabilities: [performance, documentation, writing, analysis, general, fast]
+          cost: medium
+          quality: high
+
+        - provider: codex
+          model: gpt-5.4-mini
+          capabilities: [classify, summarize, translate, simple_coding, documentation, fast, low_cost, routing]
+          cost: low
+          quality: medium
+
+        - provider: openai
+          model: glm-5.2
+          capabilities: [reasoning, planning, analysis, writing, long_context, general]
+          cost: high
+          quality: high
+
+        - provider: openai
+          model: kimi-k2.7-code
+          capabilities: [coding, review, testing, debug, refactor, scripts, tools, repository]
+          cost: high
+          quality: high
+
+        - provider: antigravity
+          model: gemini-3-flash
+          capabilities: [documentation, summarize, translate, classify, general, fast, low_cost]
+          cost: low
+          quality: medium
+
+        - provider: antigravity
+          model: gemini-3.1-flash-lite
+          capabilities: [documentation, summarize, translate, classify, fast, low_cost, routing]
+          cost: low
+          quality: medium

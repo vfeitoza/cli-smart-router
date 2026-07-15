@@ -7,6 +7,12 @@ tmp/
 # config
 .env
 
+# analises
+docs/analises/
+
+# serena
+.serena
+
 # generated plugin artifacts
 smart-model-router.so
 smart-model-router.h

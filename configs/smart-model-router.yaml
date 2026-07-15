@@ -24,6 +24,9 @@ plugins:
       virtual_model: router:auto
 
       # hybrid = deterministic config ranking + optional classifier hint + cache/session state.
+      # decision_engine = rules pipeline (Prompt->Context->Complexity->Policy->Router)
+      #   driven by the `routes:` block below; falls back to deterministic routing
+      #   when no rule matches, and applies the Fallback Engine on provider failures.
       strategy: hybrid
 
       # preference is an extra decision influencer: cost (cheapest acceptable),
@@ -99,6 +102,61 @@ plugins:
         benchmark_weight: 0.4
         llm_router_weight: 0.3
         capability_weight: 0.3
+
+      # Purpose: declarative rules-based routing (Policy Engine).
+      # Each rule has a `when` matcher and a target `model` (optionally `provider`).
+      # Every `when` field is optional and acts as a wildcard when omitted, so rules
+      # stay terse. The MOST SPECIFIC matching rule wins (the rule matching the most
+      # conditions); ties break by order (first wins). A rule with an empty `when` is
+      # a catch-all. If no rule matches (or `routes:` is absent), deterministic
+      # capability routing still decides — full backward compatibility.
+      # The target model must exist in `models:` below and its provider must be
+      # available, otherwise the rule is skipped and a less specific rule wins.
+      #
+      # Available `when` conditions:
+      #   task:            coding | planning | review | testing | debug | security | documentation | performance
+      #   language:        go | python | javascript | typescript | ... (detected from files/body)
+      #   complexity:      low | medium | high | very_high (coarse tier)
+      #   complexity_min:  0-100 (numeric score lower bound, inclusive)
+      #   complexity_max:  0-100 (numeric score upper bound, inclusive)
+      #   min_files:       route only when at least N files are referenced
+      #   has_diff:        true/false (request carries a code diff)
+      #   stream:          true/false (streaming request)
+      routes:
+        # Cheap/fast model for simple Go coding.
+        - when:
+            task: coding
+            language: go
+            complexity: low
+          provider: codex
+          model: gpt-5.4-mini
+
+        # Any low-complexity task goes to the cheapest capable model.
+        - when:
+            complexity: low
+          provider: codex
+          model: gpt-5.4-mini
+
+        # Security work always uses a top-tier model regardless of size.
+        - when:
+            task: security
+          provider: claude
+          model: claude-opus-4-8
+
+        # Large multi-file changes with a diff need strong coding models.
+        - when:
+            task: coding
+            min_files: 4
+            has_diff: true
+          provider: claude
+          model: claude-sonnet-5
+
+        # High-complexity architecture/planning uses the best reasoning model.
+        - when:
+            task: planning
+            complexity_min: 60
+          provider: claude
+          model: claude-opus-4-8
 
       # Purpose: authoritative provider/model matrix.
       # Candidate order is the deterministic fallback priority.

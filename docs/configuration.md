@@ -118,6 +118,7 @@ Available values exposed by plugin metadata:
 - `benchmark`
 - `llm`
 - `hybrid`
+- `decision_engine`
 
 Default in code: `capability`
 
@@ -127,14 +128,49 @@ Current behavior:
 - `benchmark`: currently uses the same local deterministic decision path; benchmark-specific scoring fields are kept as policy metadata for future scoring.
 - `llm`: tries the configured classifier models first on every request, then falls back to the local deterministic decision if classification fails.
 - `hybrid`: local-first. Computes the local deterministic decision first (no host call); if that decision is confident (the prompt matched a capability declared by the winning candidate; see `models[].capabilities` below), it is used directly and the classifier is skipped. Otherwise, behaves like `llm` for that request: classifier first, local decision as fallback.
+- `decision_engine`: runs the full rules pipeline (Prompt -> Context -> Complexity -> Policy Engine -> Router) driven by the `routes:` block. The most specific matching rule decides the target model; when no rule matches (or `routes:` is absent), it falls through to the local deterministic decision, preserving full backward compatibility. The ranked chain of matching rules also feeds the executor Fallback Engine when `executor_fallback.enabled` is true.
 
 The local deterministic decision never calls a classifier and keeps the router operational if the classifier fails.
+
+> Important: the `routes:` block is only evaluated when `strategy: decision_engine`.
+> With `hybrid`, `llm`, `capability`, or `benchmark`, any `routes:` rules are
+> ignored entirely. Configuring `routes:` under those strategies has no effect.
 
 Example:
 
 ```yaml
 strategy: hybrid
 ```
+
+#### `hybrid` vs `decision_engine`
+
+Both strategies compute the same local deterministic decision first, but they
+decide in fundamentally different ways:
+
+- `hybrid` decides implicitly. It scores the configured `models[]` against the
+  prompt using their `capabilities`, `cost`, and `quality`, and only calls the
+  classifier when the local score is not confident. You do not describe routes;
+  you describe models, and the router infers the best match.
+- `decision_engine` decides explicitly. It runs the analyzers to produce facts
+  (task, language, complexity, file count, diff, stream) and matches them against
+  the declarative `routes:` rules you write. You control routing directly; the
+  most specific matching rule wins.
+
+| Aspect | `hybrid` | `decision_engine` |
+| --- | --- | --- |
+| Routing driver | Implicit scoring of `models[]` | Explicit `routes:` rules |
+| Uses `routes:` | No (ignored) | Yes (primary input) |
+| Uses `models[]` | Yes (authoritative) | Yes (rule target must exist in `models[]`) |
+| Classifier call | When local score is not confident | Never (rules pipeline is fully local) |
+| Who controls routing | The router (via capabilities/cost/quality) | You (via declarative rules) |
+| Fallback when nothing matches | Classifier, then local decision | Local capability-aware deterministic decision |
+| Best when | You want good defaults with minimal config | You need predictable, auditable, per-condition routing |
+
+Both share the same foundations: `models[]` is always authoritative for
+provider/cost/quality/capabilities, and both fall back to the same local
+capability-aware deterministic decision so the router stays operational.
+`decision_engine` never calls the classifier; `hybrid` calls it only when the
+local decision is not confident.
 
 ### `preference`
 
@@ -355,6 +391,8 @@ Default in code when `<= 0`: `1024`
 
 When full, the least recently used entry is evicted.
 
+The session route map and the Decision Engine fallback-chain map are bounded by the same fixed `1024`-entry LRU internally (independent of `cache.max_entries`), so a long-running proxy does not accumulate one entry per session forever.
+
 ### `cache.ttl`
 
 Type: Go duration string
@@ -561,6 +599,84 @@ Type: `float`
 
 Policy metadata reserved for future weighted capability scoring.
 
+## `routes`
+
+Declarative rules-based routing consumed by the Policy Engine. This block is
+only used by `strategy: decision_engine`; the other strategies ignore it. When
+`routes:` is absent or no rule matches, the router falls through to the local
+capability-aware deterministic decision, so backward compatibility is preserved.
+
+Example:
+
+```yaml
+strategy: decision_engine
+
+routes:
+  # Cheap/fast model for simple Go coding.
+  - when:
+      task: coding
+      language: go
+      complexity: low
+    provider: codex
+    model: gpt-5.4-mini
+
+  # Security work always uses a top-tier model regardless of size.
+  - when:
+      task: security
+    provider: claude
+    model: claude-opus-4-8
+
+  # Large multi-file changes with a diff need strong coding models.
+  - when:
+      task: coding
+      min_files: 4
+      has_diff: true
+    provider: claude
+    model: claude-sonnet-5
+```
+
+Matching semantics:
+
+- Every `when` field is optional and acts as a wildcard when omitted.
+- The most specific matching rule wins (the rule matching the most conditions).
+- Ties break by order: the first matching rule wins.
+- A rule with an empty `when` is a catch-all (specificity 0).
+- The target `model` must exist in `models:` and its provider must be available,
+  otherwise the rule is skipped and a less specific rule (or deterministic
+  fallback) decides.
+
+### `routes[].when`
+
+Type: object of optional conditions.
+
+Available conditions:
+
+- `task`: matches the detected intent. One of `planning`, `coding`, `review`, `testing`, `debug`, `security`, `documentation`, `performance`.
+- `language`: matches the detected programming language (for example `go`, `python`, `typescript`), inferred from files/body.
+- `complexity`: matches a coarse tier. One of `low`, `medium`, `high`, `very_high`.
+- `complexity_min`: numeric score lower bound, inclusive (`0`-`100`).
+- `complexity_max`: numeric score upper bound, inclusive (`0`-`100`).
+- `min_files`: matches when at least N files are referenced.
+- `has_diff`: `true`/`false`; matches whether the request carries a code diff.
+- `stream`: `true`/`false`; matches streaming vs non-streaming requests.
+
+The facts matched against these conditions are produced by the Decision Engine
+analyzers (Prompt, Context, Complexity) from the extracted last user message and
+request body only, never from prompts or bodies written to logs or state.
+
+### `routes[].model`
+
+Type: `string`
+
+Target model ID the rule routes to. Must exist in `models:`.
+
+### `routes[].provider`
+
+Type: `string`
+
+Optional provider key. When set, it disambiguates the case where the same model
+ID exists under multiple providers. Normalized to lowercase.
+
 ## `models`
 
 Authoritative provider/model matrix.
@@ -682,10 +798,14 @@ For a request matching `virtual_model`, route selection currently happens in thi
 1. Session route, when `routing.keep_same_model_per_session` is enabled and a session route exists.
 2. Cache route, when `cache.enabled` is true and a valid cache entry exists.
 3. Local capability-aware deterministic decision, computed for every strategy (no classifier call).
-4. `hybrid`: use the local decision directly if it is confident; otherwise call the classifier. `llm`: always call the classifier. `capability`/`benchmark`: always use the local decision from step 3.
+4. Strategy-specific step:
+   - `capability`/`benchmark`: always use the local decision from step 3.
+   - `hybrid`: use the local decision directly if it is confident; otherwise call the classifier.
+   - `llm`: always call the classifier.
+   - `decision_engine`: evaluate the `routes:` block against the request facts (task, language, complexity, file count, diff, stream); the most specific matching rule decides the target model. When no rule matches, fall through to the local decision from step 3.
 5. If the classifier is called and fails, use the local decision from step 3.
 
-After classifier selection, `preference` may apply a conservative tiebreak among equivalent-tier candidates.
+After classifier selection, `preference` may apply a conservative tiebreak among equivalent-tier candidates. The `decision_engine` strategy does not apply the classifier tiebreak; its ranking comes from rule specificity.
 
 The selected route is stored in cache and optionally pinned to the session.
 

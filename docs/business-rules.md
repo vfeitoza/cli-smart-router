@@ -67,6 +67,7 @@ Supported strategy values are:
 - `benchmark`
 - `llm`
 - `hybrid`
+- `decision_engine`
 
 Current behavior:
 
@@ -74,6 +75,7 @@ Current behavior:
 - `benchmark`: currently behaves like `capability`; benchmark fields are reserved for future scoring.
 - `llm`: classifier first on every request, local deterministic decision as fallback on classifier failure.
 - `hybrid`: local-first. Uses the local decision directly when it is locally confident, skipping the classifier; otherwise behaves like `llm` for that request.
+- `decision_engine`: runs the declarative rules pipeline (Prompt -> Context -> Complexity -> Policy Engine -> Model Router) driven by the `routes:` block. When no rule matches, or the decided target cannot be located, it falls back to the local deterministic decision.
 
 Every strategy must keep the local deterministic decision available so the router remains operational when advanced features fail.
 
@@ -94,6 +96,50 @@ The local decision is "confident" only when both of these hold:
 An ambiguous prompt (no capability signal matched) or a configuration where no candidate declares a matching capability is never confident, even though a candidate is still deterministically chosen by cost/quality tier ranking.
 
 `hybrid` uses this confidence to decide whether to call the classifier. `capability`, `benchmark`, and the fallback path of `llm` use the local decision regardless of confidence, because they have no classifier step (or the classifier already failed).
+
+## Decision Engine Rule
+
+When `strategy` is `decision_engine`, the router runs a deterministic, rules-based pipeline before any deterministic fallback:
+
+1. Prompt Analyzer: classify the extracted last user message into a task Intent (`planning`, `coding`, `review`, `testing`, `debug`, `security`, `documentation`, `performance`, or unknown).
+2. Context Analyzer: derive non-sensitive signals (file count, detected language, context size, tool count, history turns, diff size).
+3. Complexity Analyzer: produce a `[0,100]` complexity score, a coarse level, and a minimum cost tier from eight weighted factors.
+4. Policy Engine: match the request facts against the configured `routes:` rules and produce the ordered chain of allowed targets.
+5. Model Router: forward the winning target; the Router only locates the provider/model, it does not score or pick.
+
+The Policy Engine decides and the Model Router forwards. These responsibilities must stay separate: the Router must never re-score or re-rank.
+
+When no rule matches, or the decided target cannot be located among configured, available candidates, the pipeline abstains and the local deterministic decision is used. This keeps full backward compatibility: `routes:` is optional and its absence changes nothing.
+
+A non-sensitive decision trace (task, language, complexity score, matched policy, provider, model, reason, decision time) is recorded for the last decision regardless of whether a rule matched.
+
+## Policy Engine Rule
+
+The Policy Engine evaluates declarative `routes:` rules against request facts. It does no text analysis itself; it only matches facts the analyzers already produced.
+
+Rule matching:
+
+- Every `when` condition is optional; an omitted condition is a wildcard.
+- Supported conditions: `task`, `language`, `complexity` (coarse tier), `complexity_min`/`complexity_max` (numeric score bounds), `min_files`, `has_diff`, `stream`.
+- The most specific matching rule wins, where specificity is the number of active conditions the rule matched.
+- Ties break by rule order: the first rule wins.
+- A rule with an empty `when` is a catch-all with specificity 0.
+
+Target validation:
+
+- A rule is skipped when its target `model` is empty, is not present in configured `models`, or its provider is unavailable.
+- When a rule sets `provider`, both provider and model must match a configured candidate; otherwise the first candidate with the model id is used.
+- Skipping an invalid rule lets a less specific rule (or deterministic fallback) win, so a misconfigured rule never breaks routing.
+
+## Fallback Engine Rule
+
+The Policy Engine produces an ordered chain of allowed targets, not just one. The Fallback Engine walks that chain to pick the next allowed model after a provider failure.
+
+A failure is fallbackable when it is a timeout, HTTP error, context exceeded, token limit, or provider unavailability. Any other outcome (including success) is not fallbackable and stops the walk.
+
+Failed provider/model pairs are marked and skipped so the engine never retries the same failed target. When the chain is exhausted, the request fails with the last error.
+
+The fallback chain is ephemeral, per-session, in-memory, and never persisted. It is bounded like the other in-memory maps so a long-running proxy does not accumulate one chain per session forever.
 
 ## Preference Rule
 
@@ -204,9 +250,10 @@ For matching virtual-model requests, route selection order is:
 1. Existing session route.
 2. Existing cache route.
 3. Local capability-aware deterministic decision, computed always (no classifier call).
-4. For `hybrid`: use the local decision directly if confident; otherwise call the classifier.
-5. For `llm`: call the classifier regardless of local confidence.
-6. If the classifier is called and fails, use the local decision from step 3 (this is the deterministic fallback).
+4. For `decision_engine`: run the rules pipeline (Prompt -> Context -> Complexity -> Policy Engine -> Model Router). Use its target when a rule matches and the target is locatable; otherwise fall through to the local decision from step 3.
+5. For `hybrid`: use the local decision directly if confident; otherwise call the classifier.
+6. For `llm`: call the classifier regardless of local confidence.
+7. If the classifier is called and fails, use the local decision from step 3 (this is the deterministic fallback).
 
 Newly selected routes should be cached when cache is enabled and pinned to the session when session affinity is enabled.
 
@@ -293,6 +340,7 @@ Logs may include:
 - target provider/model
 - reason
 - classifier trace
+- decision trace (for `decision_engine`: task, language, complexity score, matched policy, decision time)
 
 Logs must not include:
 
@@ -313,6 +361,9 @@ Runtime state may persist only non-sensitive data:
 - route cache
 - session routes
 - counters
+- last decision-engine outcome (task, language, score, policy, provider, model, reason, decision time)
+
+The in-memory maps (route cache, session routes, and the ephemeral decision-engine fallback chains) are all bounded by a shared LRU limit (default 1024 entries) so a long-running proxy does not grow memory without limit. Fallback chains are never persisted to disk; they are short-lived and rebuilt per request.
 
 Runtime state must not persist:
 
