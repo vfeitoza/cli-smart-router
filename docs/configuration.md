@@ -664,6 +664,26 @@ The facts matched against these conditions are produced by the Decision Engine
 analyzers (Prompt, Context, Complexity) from the extracted last user message and
 request body only, never from prompts or bodies written to logs or state.
 
+#### OpenCode Subagent Overrides
+
+The router recognizes optional client-supplied phase declarations before lexical
+intent detection. They are useful when an OpenCode subagent prompt embeds a
+planning document whose keywords would otherwise outweigh its implementation
+instruction.
+
+Precedence is:
+
+1. Valid `X-Router-Task` request header.
+2. Known `X-Router-Agent` request header: `planner`, `implementer`, or `reviewer`.
+3. Valid `[router-task: <intent>]` tag in the extracted last user message.
+4. Known `[router-agent: <agent>]` tag in that message.
+5. Built-in keyword analysis.
+
+Valid task values are `planning`, `coding`, `review`, `testing`, `debug`,
+`security`, `documentation`, and `performance`. Invalid headers or tags are
+ignored. The override participates in the route cache key, so a cached planning
+route cannot be reused for the same prompt sent with `X-Router-Task: coding`.
+
 ### `routes[].model`
 
 Type: `string`

@@ -75,6 +75,15 @@ Decision order:
 
 The local decision infers capability tags from the extracted last user message (for example, "resuma" implies `summarize`; "arquitetura" implies `architecture`/`planning`; "erro"/"bug" implies `coding`/`review`) and, when at least one candidate declares a matching capability, narrows selection to candidates that do. `preference` then ranks the remaining pool by cost/quality tier. See `docs/adr/0003-local-first-hybrid-routing.md` for details.
 
+OpenCode subagents can declare a routing phase. A valid `X-Router-Task` header
+(`planning`, `coding`, `review`, `testing`, `debug`, `security`,
+`documentation`, or `performance`) overrides lexical intent detection. When no
+valid task header is present, the router accepts `X-Router-Agent` values
+`planner`, `implementer`, and `reviewer`; it then checks matching
+`[router-task: ...]` and `[router-agent: ...]` tags in the last user message.
+This keeps an implementer on a code route even when its attached plan mentions
+architecture or roadmap work.
+
 The classifier, when called, receives an isolated routing prompt with the configured model catalog and the extracted last user message. It must select a configured model; invalid classifier output falls back to the local deterministic decision.
 
 Default provider-route response:

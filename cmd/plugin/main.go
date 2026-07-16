@@ -375,7 +375,7 @@ func buildRouteFacts(cfg domain.Config, req infrastructure.ModelRouteRequest) do
 	})
 	complexity := domain.AssessComplexity(domain.ComplexityInputFromSignals(prompt, ctx, nil, 0))
 	return domain.RouteFacts{
-		Task:            domain.DetectIntent(prompt),
+		Task:            routingTask(req, prompt),
 		Language:        ctx.Language,
 		ComplexityScore: complexity.Score,
 		ComplexityTier:  complexity.MinCostTier,
@@ -383,6 +383,28 @@ func buildRouteFacts(cfg domain.Config, req infrastructure.ModelRouteRequest) do
 		HasDiff:         ctx.DiffSize > 0,
 		Stream:          req.Stream,
 	}
+}
+
+// routingTask lets trusted clients declare a subagent phase without letting the
+// attached plan or tool history outweigh that phase's user prompt.
+func routingTask(req infrastructure.ModelRouteRequest, prompt string) domain.Intent {
+	if task := routingTaskOverride(req, prompt); task.Valid() {
+		return task
+	}
+	return domain.DetectIntent(prompt)
+}
+
+func routingTaskOverride(req infrastructure.ModelRouteRequest, prompt string) domain.Intent {
+	if task := domain.ParseIntent(req.Headers.Get("X-Router-Task")); task.Valid() {
+		return task
+	}
+	if task := domain.RouterAgentIntent(req.Headers.Get("X-Router-Agent")); task.Valid() {
+		return task
+	}
+	if task := domain.RouterTaskIntent(prompt); task.Valid() {
+		return task
+	}
+	return domain.RouterAgentTagIntent(prompt)
 }
 
 // storeFallbackChain caches the ordered policy-allowed targets for a request so the
@@ -558,6 +580,10 @@ func routeCacheKey(req infrastructure.ModelRouteRequest) string {
 	h.Write([]byte(req.RequestedModel))
 	h.Write([]byte{0})
 	h.Write([]byte(strings.TrimSpace(prompt)))
+	if task := routingTaskOverride(req, prompt); task.Valid() {
+		h.Write([]byte{0})
+		h.Write([]byte(task))
+	}
 	return hex.EncodeToString(h.Sum(nil))
 }
 
@@ -961,7 +987,7 @@ func pluginRegistration() registration {
 			GitHubRepository: "https://github.com/vfeitoza/cli-smart-router",
 			ConfigFields: []infrastructure.ConfigField{
 				{Name: "virtual_model", Type: infrastructure.ConfigFieldTypeString, Description: "Virtual model name intercepted by the router. Default: router:auto."},
-				{Name: "strategy", Type: infrastructure.ConfigFieldTypeEnum, EnumValues: []string{"capability", "benchmark", "llm", "hybrid", "decision_engine"}, Description: "Routing strategy. V1 uses deterministic capability routing."},
+				{Name: "strategy", Type: infrastructure.ConfigFieldTypeEnum, EnumValues: []string{"capability", "benchmark", "llm", "hybrid", "decision_engine"}, Description: "Routing strategy. decision_engine evaluates declarative routes before deterministic fallback."},
 				{Name: "debug", Type: infrastructure.ConfigFieldTypeObject, Description: "Optional non-sensitive route decision JSONL logging settings."},
 				{Name: "catalog", Type: infrastructure.ConfigFieldTypeObject, Description: "Catalog refresh settings for CLIProxyAPI /v1/models."},
 				{Name: "pricing", Type: infrastructure.ConfigFieldTypeObject, Description: "Optional external pricing refresh settings."},
@@ -969,6 +995,7 @@ func pluginRegistration() registration {
 				{Name: "executor_fallback", Type: infrastructure.ConfigFieldTypeObject, Description: "Optional non-streaming same-request fallback executor settings."},
 				{Name: "classifier", Type: infrastructure.ConfigFieldTypeObject, Description: "Optional ordered classifier model fallback settings."},
 				{Name: "routing", Type: infrastructure.ConfigFieldTypeObject, Description: "Routing policy weights and limits."},
+				{Name: "routes", Type: infrastructure.ConfigFieldTypeObject, Description: "Declarative Decision Engine route rules. Each rule selects a provider and model when its conditions match."},
 				{Name: "models", Type: infrastructure.ConfigFieldTypeObject, Description: "Candidate provider/model matrix with capabilities and quality metadata."},
 				{Name: "state_path", Type: infrastructure.ConfigFieldTypeString, Description: "Optional local state file path for future benchmark persistence."},
 			},

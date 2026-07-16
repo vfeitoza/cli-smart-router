@@ -214,6 +214,18 @@ Reason:
 
 The plugin must support common request body shapes such as OpenAI/Claude `messages` and Gemini `contents.parts`.
 
+## Subagent Task Override Rule
+
+Trusted clients may set `X-Router-Task` to a valid task intent. The router uses
+it before keyword analysis. When that header is absent or invalid, it accepts a
+known `X-Router-Agent` (`planner`, `implementer`, or `reviewer`), then the
+equivalent `[router-task: ...]` and `[router-agent: ...]` tags from the last
+user message. Invalid declarations fall back to normal lexical analysis.
+
+The effective override is included in cache-key material. This prevents a route
+selected for a planning prompt from being reused for an implementer invocation
+with the same prompt text.
+
 ## Route Cache Rule
 
 When `cache.enabled` is true, repeated identical prompts should reuse the same route decision.

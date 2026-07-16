@@ -51,6 +51,71 @@ func (i Intent) Valid() bool {
 	}
 }
 
+// ParseIntent returns a known intent for a routing override value.
+func ParseIntent(value string) Intent {
+	switch Intent(strings.ToLower(strings.TrimSpace(value))) {
+	case IntentPlanning:
+		return IntentPlanning
+	case IntentCoding:
+		return IntentCoding
+	case IntentReview:
+		return IntentReview
+	case IntentTesting:
+		return IntentTesting
+	case IntentDebug:
+		return IntentDebug
+	case IntentSecurity:
+		return IntentSecurity
+	case IntentDocumentation:
+		return IntentDocumentation
+	case IntentPerformance:
+		return IntentPerformance
+	default:
+		return IntentUnknown
+	}
+}
+
+// RouterTaskIntent extracts a valid [router-task: intent] marker from a prompt.
+func RouterTaskIntent(prompt string) Intent {
+	return routerMarkerIntent(prompt, "[router-task:", ParseIntent)
+}
+
+// RouterAgentIntent maps known OpenCode subagent names to their task intent.
+func RouterAgentIntent(agent string) Intent {
+	switch strings.ToLower(strings.TrimSpace(agent)) {
+	case "planner":
+		return IntentPlanning
+	case "implementer":
+		return IntentCoding
+	case "reviewer":
+		return IntentReview
+	default:
+		return IntentUnknown
+	}
+}
+
+// RouterAgentTagIntent extracts a valid [router-agent: name] marker from a prompt.
+func RouterAgentTagIntent(prompt string) Intent {
+	return routerMarkerIntent(prompt, "[router-agent:", RouterAgentIntent)
+}
+
+func routerMarkerIntent(prompt, marker string, parse func(string) Intent) Intent {
+	lower := strings.ToLower(prompt)
+	for {
+		start := strings.Index(lower, marker)
+		if start < 0 {
+			return IntentUnknown
+		}
+		value := lower[start+len(marker):]
+		if end := strings.IndexByte(value, ']'); end >= 0 {
+			if intent := parse(value[:end]); intent.Valid() {
+				return intent
+			}
+		}
+		lower = value
+	}
+}
+
 // intentSignal maps a lowercase keyword to the intent it implies and a weight.
 // Keywords are matched as substrings against the lowercased prompt, covering both
 // Portuguese and English without a full NLP pipeline, mirroring capabilitySignals.

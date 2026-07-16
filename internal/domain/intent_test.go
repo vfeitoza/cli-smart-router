@@ -150,3 +150,36 @@ func TestIntentStringAndValid(t *testing.T) {
 		t.Fatalf("security must be valid")
 	}
 }
+
+func TestParseIntent(t *testing.T) {
+	if got := ParseIntent(" Coding "); got != IntentCoding {
+		t.Fatalf("expected coding, got %q", got)
+	}
+	if got := ParseIntent("invalid"); got != IntentUnknown {
+		t.Fatalf("expected unknown, got %q", got)
+	}
+}
+
+func TestRouterTaskIntent(t *testing.T) {
+	if got := RouterTaskIntent("[router-task: coding]\nImplemente o plano e use a arquitetura."); got != IntentCoding {
+		t.Fatalf("expected coding override, got %q", got)
+	}
+	if got := RouterTaskIntent("[router-task: invalid]\n[router-task: review]"); got != IntentReview {
+		t.Fatalf("expected later valid override, got %q", got)
+	}
+	if got := RouterTaskIntent("[router-task: unknown]"); got != IntentUnknown {
+		t.Fatalf("expected unknown, got %q", got)
+	}
+}
+
+func TestRouterAgentIntent(t *testing.T) {
+	if got := RouterAgentIntent("Implementer"); got != IntentCoding {
+		t.Fatalf("expected coding, got %q", got)
+	}
+	if got := RouterAgentTagIntent("[router-agent: reviewer]"); got != IntentReview {
+		t.Fatalf("expected review, got %q", got)
+	}
+	if got := RouterAgentIntent("unknown"); got != IntentUnknown {
+		t.Fatalf("expected unknown, got %q", got)
+	}
+}

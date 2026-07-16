@@ -459,7 +459,8 @@ The `decision_engine` strategy is a deterministic, rules-driven pipeline layered
 
 ```text
 request body
-  -> Prompt Analyzer     (domain.DetectIntent)      -> Task intent
+  -> Task override       (header/tag, when valid)    -> Task intent
+  -> Prompt Analyzer     (domain.DetectIntent)       -> Task intent fallback
   -> Context Analyzer    (domain.AnalyzeContext)     -> language, file count, diff size, ...
   -> Complexity Analyzer (domain.AssessComplexity)   -> score [0,100] + tier
   -> RouteFacts assembled from the three analyzers
@@ -469,11 +470,12 @@ request body
 
 Stages:
 
-1. **Prompt Analyzer** (`intent.go`): classifies the extracted last user message into one `Intent`.
-2. **Context Analyzer** (`context.go`): derives `ContextSignals` (language, file count, context size, tool count, history turns, diff size) from the prompt and raw body.
-3. **Complexity Analyzer** (`complexity.go`): scores complexity `[0,100]` and derives the minimum cost tier.
-4. **Policy Engine** (`policy_engine.go`): matches the `RouteFacts` against the declarative `routes:` rules table and returns the ranked chain of allowed targets, most specific rule first, ties broken by rule order. Targets are validated against configured candidates and available providers.
-5. **Model Router** (`policy_router.go`): takes the winning `PolicyDecision` and locates the provider route. It makes no routing decision of its own.
+1. **Task override** (`main.go`, `intent.go`): uses a valid `X-Router-Task`, then a known `X-Router-Agent`, then matching user-message tags before heuristic analysis. This is intended for trusted agent orchestration.
+2. **Prompt Analyzer** (`intent.go`): classifies the extracted last user message into one `Intent` when no override applies.
+3. **Context Analyzer** (`context.go`): derives `ContextSignals` (language, file count, context size, tool count, history turns, diff size) from the prompt and raw body.
+4. **Complexity Analyzer** (`complexity.go`): scores complexity `[0,100]` and derives the minimum cost tier.
+5. **Policy Engine** (`policy_engine.go`): matches the `RouteFacts` against the declarative `routes:` rules table and returns the ranked chain of allowed targets, most specific rule first, ties broken by rule order. Targets are validated against configured candidates and available providers.
+6. **Model Router** (`policy_router.go`): takes the winning `PolicyDecision` and locates the provider route. It makes no routing decision of its own.
 
 When the ranked chain is non-empty and the first target can be located, that route is used and the full chain is cached (keyed by `execution_session_id`) so the executor fallback path can walk the remaining allowed targets on provider failure via the Fallback Engine (`fallback.go`). When the chain is empty or the target cannot be located, the pipeline abstains and the local deterministic decision is used instead.
 
