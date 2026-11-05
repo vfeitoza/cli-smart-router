@@ -834,6 +834,14 @@ func handleUsage(raw []byte) ([]byte, error) {
 	return infrastructure.OKEnvelope(map[string]bool{"handled": true})
 }
 
+type hostModelExecutor func(req infrastructure.HostModelExecutionRPCRequest) (infrastructure.HostModelExecutionResponse, error)
+
+var hostModelExecute hostModelExecutor = defaultHostModelExecute
+
+func defaultHostModelExecute(req infrastructure.HostModelExecutionRPCRequest) (infrastructure.HostModelExecutionResponse, error) {
+	return callHost[infrastructure.HostModelExecutionResponse](infrastructure.MethodHostModelExecute, req)
+}
+
 func executeWithFallback(raw []byte) ([]byte, error) {
 	var req infrastructure.ExecutorRPCRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
@@ -845,6 +853,9 @@ func executeWithFallback(raw []byte) ([]byte, error) {
 	// request carries a session with a cached chain; otherwise fall back to the
 	// configured model order (legacy behavior).
 	providers, models := executorCandidateChain(cfg, req)
+	if len(models) == 0 {
+		return infrastructure.ErrorEnvelope("executor_fallback_failed", "no executor fallback candidate available"), nil
+	}
 
 	requestBody := req.OriginalRequest
 	if len(requestBody) == 0 {
@@ -858,7 +869,7 @@ func executeWithFallback(raw []byte) ([]byte, error) {
 		if model == "" {
 			continue
 		}
-		resp, err := callHost[infrastructure.HostModelExecutionResponse](infrastructure.MethodHostModelExecute, infrastructure.HostModelExecutionRPCRequest{
+		resp, err := hostModelExecute(infrastructure.HostModelExecutionRPCRequest{
 			HostModelExecutionRequest: infrastructure.HostModelExecutionRequest{
 				EntryProtocol: req.SourceFormat,
 				ExitProtocol:  req.SourceFormat,
@@ -871,26 +882,44 @@ func executeWithFallback(raw []byte) ([]byte, error) {
 			},
 			HostCallbackID: req.HostCallbackID,
 		})
-		outcome := domain.AttemptOutcome{}
 		if err != nil {
-			outcome.Err = err.Error()
-		} else {
-			outcome.StatusCode = resp.StatusCode
+			errText := err.Error()
+			if !domain.IsRetryableRPCError(errText) {
+				// Nonretryable RPC errors must return error, not empty success.
+				return infrastructure.ErrorEnvelope("host_execution_failed", errText), nil
+			}
+			// Retryable host RPC error (e.g. model_cooldown, cooling down, quota, rate limit, auth_unavailable)
+			if domain.IsCooldownError(errText) {
+				cooldownDur := domain.CalculateCooldown("", time.Now())
+				runtimeState.SetCooldown(provider, model, time.Now().Add(cooldownDur))
+			}
+			domain.MarkFailed(failed, provider, model)
+			runtimeState.Inc("router_fallback_rpc_error")
+			lastErr = err
+			continue
+		}
+
+		outcome := domain.AttemptOutcome{
+			StatusCode: resp.StatusCode,
 		}
 		reason := domain.ClassifyFailure(outcome)
 		if !reason.Fallbackable() {
+			runtimeState.ClearCooldown(provider, model)
 			return infrastructure.OKEnvelope(infrastructure.ExecutorResponse{Payload: resp.Body, Headers: resp.Headers})
 		}
-		// Fallback Engine: record the failed model and continue to the next
-		// policy-allowed candidate for timeout, HTTP error, context exceeded,
-		// token limit, or unavailability.
+
+		// Fallback Engine: record the failed model and mark cooldown on rate limit or cooldown body
+		if resp.StatusCode == 429 || domain.IsCooldownError(string(resp.Body)) {
+			retryAfter := ""
+			if resp.Headers != nil {
+				retryAfter = resp.Headers.Get("Retry-After")
+			}
+			cooldownDur := domain.CalculateCooldown(retryAfter, time.Now())
+			runtimeState.SetCooldown(provider, model, time.Now().Add(cooldownDur))
+		}
 		domain.MarkFailed(failed, provider, model)
 		runtimeState.Inc("router_fallback_" + string(reason))
-		if err != nil {
-			lastErr = err
-		} else {
-			lastErr = fmt.Errorf("candidate %s failed: %s (status %d)", model, reason, resp.StatusCode)
-		}
+		lastErr = fmt.Errorf("candidate %s failed: %s (status %d)", model, reason, resp.StatusCode)
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("no executor fallback candidate available")
@@ -900,23 +929,53 @@ func executeWithFallback(raw []byte) ([]byte, error) {
 
 // executorCandidateChain returns the ordered provider/model pairs the executor
 // should try. It uses the Decision Engine's cached policy chain for the request's
-// session when present; otherwise it uses the configured model order, capped by
-// executor_fallback.max_attempts (legacy behavior).
+// session when present; otherwise it uses the configured model order. In both cases,
+// healthy targets are ordered before cooling targets BEFORE max_attempts truncation.
 func executorCandidateChain(cfg domain.Config, req infrastructure.ExecutorRPCRequest) ([]string, []string) {
+	maxAttempts := cfg.ExecutorFallback.MaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = 3
+	}
+
+	var rawTargets []domain.CandidateTarget
 	if sessionID := metadataString(req.Metadata, "execution_session_id"); sessionID != "" {
 		if chain, ok := runtimeState.GetFallbackChain(sessionID); ok {
-			return chain.Providers, chain.Models
+			for i := range chain.Models {
+				provider := ""
+				if i < len(chain.Providers) {
+					provider = chain.Providers[i]
+				}
+				rawTargets = append(rawTargets, domain.CandidateTarget{
+					Provider: provider,
+					Model:    chain.Models[i],
+				})
+			}
+		} else {
+			// A missing explicit policy chain must not widen provider access.
+			return nil, nil
 		}
 	}
-	maxAttempts := cfg.ExecutorFallback.MaxAttempts
-	if maxAttempts <= 0 || maxAttempts > len(cfg.Models) {
-		maxAttempts = len(cfg.Models)
+	if len(rawTargets) == 0 {
+		for _, m := range cfg.Models {
+			if m.Model != "" {
+				rawTargets = append(rawTargets, domain.CandidateTarget{
+					Provider: m.Provider,
+					Model:    m.Model,
+				})
+			}
+		}
 	}
-	providers := make([]string, 0, maxAttempts)
-	models := make([]string, 0, maxAttempts)
-	for i := 0; i < maxAttempts; i++ {
-		providers = append(providers, cfg.Models[i].Provider)
-		models = append(models, cfg.Models[i].Model)
+
+	now := time.Now()
+	ordered := domain.OrderCandidatesByCooldown(rawTargets, func(provider, model string) (time.Time, bool) {
+		return runtimeState.CooldownUntil(provider, model, now)
+	}, maxAttempts)
+
+	providers := make([]string, 0, len(ordered))
+	models := make([]string, 0, len(ordered))
+	for _, target := range ordered {
+		providers = append(providers, target.Provider)
+		models = append(models, target.Model)
 	}
 	return providers, models
 }

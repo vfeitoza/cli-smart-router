@@ -27,6 +27,8 @@ By default, the plugin returns `TargetKind: provider`. CLIProxyAPI keeps respons
 
 The plugin only routes requests where `RequestedModel` matches the configured `virtual_model`. Every other model returns `Handled: false`.
 
+The optional non-streaming executor orders eligible targets by in-memory cooldown before applying its attempt limit. Domain helpers classify retryable failures and parse bounded cooldown durations; mutex-protected runtime state stores at most 1024 provider/model cooldowns. An explicit execution session must resolve to its cached policy chain, never the global model list. See [ADR 0007](adr/0007-cooldown-aware-executor-fallback.md).
+
 ## Package Layout
 
 ```text

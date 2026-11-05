@@ -412,6 +412,8 @@ When enabled, non-streaming requests may be routed to the plugin itself for same
 
 Streaming executor fallback is not implemented.
 
+Retryable RPC failures advance within the eligible candidate chain; other RPC failures return an explicit error, never an empty success. Quota, cooldown, and unavailable-auth failures record bounded provider/model cooldowns. Healthy candidates precede cooling candidates before the attempt limit is applied; successful execution clears cooldown state. If an explicit execution session has no cached policy chain, execution fails closed instead of trying unrelated configured models.
+
 ## Management Rule
 
 The plugin exposes a management status route:

@@ -1,6 +1,9 @@
 package domain
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestClassifyFailureReasons(t *testing.T) {
 	cases := []struct {
@@ -149,5 +152,135 @@ func TestEvaluateRoutesRankedEmptyWhenNoMatch(t *testing.T) {
 	chain := EvaluateRoutesRanked(rules, RouteFacts{Task: IntentCoding, Language: "go"}, routeTestCandidates(), nil)
 	if len(chain) != 0 {
 		t.Fatalf("expected empty chain, got %d", len(chain))
+	}
+}
+
+func TestOrderCandidatesByCooldown(t *testing.T) {
+	now := time.Now()
+	targets := []CandidateTarget{
+		{Provider: "p1", Model: "m1"},
+		{Provider: "p2", Model: "m2"},
+		{Provider: "p3", Model: "m3"},
+	}
+
+	// 1. All healthy: preserved order, capped by maxAttempts
+	got := OrderCandidatesByCooldown(targets, func(provider, model string) (time.Time, bool) {
+		return time.Time{}, false
+	}, 2)
+	if len(got) != 2 || got[0].Model != "m1" || got[1].Model != "m2" {
+		t.Fatalf("expected [m1, m2], got %+v", got)
+	}
+
+	// 2. Primary m1 cooling: m2 and m3 are healthy, so m3 beyond maxAttempts (pos 2) becomes reachable
+	cooldowns := map[string]time.Time{
+		"p1/m1": now.Add(30 * time.Second),
+	}
+	got = OrderCandidatesByCooldown(targets, func(provider, model string) (time.Time, bool) {
+		until, ok := cooldowns[FallbackKey(provider, model)]
+		return until, ok
+	}, 2)
+	if len(got) != 2 || got[0].Model != "m2" || got[1].Model != "m3" {
+		t.Fatalf("expected healthy beyond max_attempts to be reachable: want [m2, m3], got %+v", got)
+	}
+
+	// 3. Multiple cooling targets: ordered by earliest expiry
+	cooldowns = map[string]time.Time{
+		"p1/m1": now.Add(40 * time.Second),
+		"p2/m2": now.Add(10 * time.Second),
+	}
+	got = OrderCandidatesByCooldown(targets, func(provider, model string) (time.Time, bool) {
+		until, ok := cooldowns[FallbackKey(provider, model)]
+		return until, ok
+	}, 3)
+	if len(got) != 3 || got[0].Model != "m3" || got[1].Model != "m2" || got[2].Model != "m1" {
+		t.Fatalf("expected healthy m3 first, then m2 (earliest), then m1: got %+v", got)
+	}
+}
+
+func TestParseRetryAfterAndCalculateCooldown(t *testing.T) {
+	now := time.Date(2026, 3, 30, 12, 0, 0, 0, time.UTC)
+
+	// Delta seconds
+	dur, ok := ParseRetryAfter("60", now)
+	if !ok || dur != 60*time.Second {
+		t.Fatalf("expected 60s, got %v ok=%v", dur, ok)
+	}
+
+	// HTTP-date RFC1123
+	dateStr := now.Add(45 * time.Second).Format(time.RFC1123)
+	dur, ok = ParseRetryAfter(dateStr, now)
+	if !ok || dur != 45*time.Second {
+		t.Fatalf("expected 45s, got %v ok=%v", dur, ok)
+	}
+
+	// Invalid / empty
+	if _, ok := ParseRetryAfter("", now); ok {
+		t.Fatal("expected empty to fail")
+	}
+	if _, ok := ParseRetryAfter("not-a-date", now); ok {
+		t.Fatal("expected invalid to fail")
+	}
+
+	// CalculateCooldown: default when no header
+	if got := CalculateCooldown("", now); got != DefaultCooldown {
+		t.Fatalf("expected DefaultCooldown %v, got %v", DefaultCooldown, got)
+	}
+
+	// CalculateCooldown: capped to MaxCooldown
+	if got := CalculateCooldown("999999", now); got != MaxCooldown {
+		t.Fatalf("expected MaxCooldown %v, got %v", MaxCooldown, got)
+	}
+}
+
+func TestRetryAfterOverflowSaturates(t *testing.T) {
+	now := time.Now()
+	for _, value := range []string{"9223372036854775807", "18446744074"} {
+		duration, ok := ParseRetryAfter(value, now)
+		if !ok || duration <= 0 {
+			t.Fatalf("Retry-After %q wrapped: %v, %v", value, duration, ok)
+		}
+		if got := CalculateCooldown(value, now); got != MaxCooldown {
+			t.Fatalf("Retry-After %q: got %v, want %v", value, got, MaxCooldown)
+		}
+	}
+}
+
+func TestIsRetryableRPCErrorAndIsCooldownError(t *testing.T) {
+	retryableCases := []string{
+		"model_cooldown: claude is cooling down",
+		"model is cooling down",
+		"rate_limit_exceeded: too many requests",
+		"quota_exceeded: insufficient quota",
+		"auth_unavailable: no token",
+		"context deadline exceeded",
+		"upstream connection refused",
+		"server overloaded",
+	}
+	for _, text := range retryableCases {
+		if !IsRetryableRPCError(text) {
+			t.Fatalf("expected %q to be retryable", text)
+		}
+	}
+
+	nonretryableCases := []string{
+		"invalid_argument: bad model",
+		"unknown_method: foo",
+		"unsupported_protocol: grpc",
+		"bad_request: prompt cannot be empty",
+	}
+	for _, text := range nonretryableCases {
+		if IsRetryableRPCError(text) {
+			t.Fatalf("expected %q to be nonretryable", text)
+		}
+	}
+
+	if !IsCooldownError("model_cooldown: cooling down") {
+		t.Fatal("expected cooldown error")
+	}
+	if !IsCooldownError("rate limit reached") {
+		t.Fatal("expected rate limit cooldown error")
+	}
+	if IsCooldownError("upstream connection refused") {
+		t.Fatal("connection refused should not be a rate-limit/quota cooldown error")
 	}
 }

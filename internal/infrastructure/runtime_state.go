@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/vfeitoza/cli-smart-router/internal/domain"
 )
 
 // defaultMaxEntries bounds the in-memory maps (route cache, sessions, fallback
@@ -19,6 +21,7 @@ type RuntimeState struct {
 	data           RuntimeStateData
 	lastDiskSave   time.Time
 	fallbackChains map[string]FallbackChain
+	cooldowns      map[string]time.Time
 }
 
 // FallbackChain is an ephemeral, in-memory ordered list of policy-allowed targets
@@ -101,6 +104,106 @@ func NewRuntimeState() *RuntimeState {
 			Counters:   map[string]int64{},
 		},
 		fallbackChains: map[string]FallbackChain{},
+		cooldowns:      map[string]time.Time{},
+	}
+}
+
+// SetCooldown marks a provider/model target as cooling down until the specified time.
+// It is bounded to defaultMaxEntries, evicting expired entries first and earliest expiring entries if needed.
+func (s *RuntimeState) SetCooldown(provider, model string, until time.Time) {
+	if s == nil {
+		return
+	}
+	key := domain.FallbackKey(provider, model)
+	if key == "/" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cooldowns == nil {
+		s.cooldowns = map[string]time.Time{}
+	}
+	if _, exists := s.cooldowns[key]; !exists && len(s.cooldowns) >= defaultMaxEntries {
+		now := time.Now()
+		for k, exp := range s.cooldowns {
+			if !exp.After(now) {
+				delete(s.cooldowns, k)
+			}
+		}
+		for len(s.cooldowns) >= defaultMaxEntries {
+			var earliestKey string
+			var earliestExp time.Time
+			first := true
+			for k, exp := range s.cooldowns {
+				if first || exp.Before(earliestExp) {
+					earliestKey = k
+					earliestExp = exp
+					first = false
+				}
+			}
+			if earliestKey != "" {
+				delete(s.cooldowns, earliestKey)
+			} else {
+				break
+			}
+		}
+	}
+	s.cooldowns[key] = until
+}
+
+// CooldownUntil returns the cooldown expiry time for a provider/model and true if actively cooling at now.
+// If the cooldown has expired at now, the entry is evicted and false is returned (recovered cooldown eviction).
+func (s *RuntimeState) CooldownUntil(provider, model string, now time.Time) (time.Time, bool) {
+	if s == nil {
+		return time.Time{}, false
+	}
+	key := domain.FallbackKey(provider, model)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cooldowns == nil {
+		return time.Time{}, false
+	}
+	until, ok := s.cooldowns[key]
+	if !ok {
+		return time.Time{}, false
+	}
+	if !until.After(now) {
+		delete(s.cooldowns, key)
+		return time.Time{}, false
+	}
+	return until, true
+}
+
+// IsCooling reports whether the provider/model is actively cooling down at now.
+func (s *RuntimeState) IsCooling(provider, model string, now time.Time) bool {
+	_, cooling := s.CooldownUntil(provider, model, now)
+	return cooling
+}
+
+// ClearCooldown removes the cooldown for a provider/model on success.
+func (s *RuntimeState) ClearCooldown(provider, model string) {
+	if s == nil {
+		return
+	}
+	key := domain.FallbackKey(provider, model)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cooldowns != nil {
+		delete(s.cooldowns, key)
+	}
+}
+
+// EvictExpiredCooldowns purges any cooldowns that have expired as of now.
+func (s *RuntimeState) EvictExpiredCooldowns(now time.Time) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, exp := range s.cooldowns {
+		if !exp.After(now) {
+			delete(s.cooldowns, k)
+		}
 	}
 }
 

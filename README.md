@@ -100,7 +100,7 @@ Default provider-route response:
 
 A `hybrid` request that skipped the classifier because the local decision was confident has a `Reason` prefixed with `local_confident`, for example `"local_confident deterministic_fallback strategy:hybrid capabilities:1/1 preference:balanced provider:codex cost:low"`.
 
-When `executor_fallback.enabled: true` and the request is non-streaming, `model.route` returns `TargetKind: "self"`. The plugin executor then tries configured candidates in order with `host.model.execute` until one succeeds.
+When `executor_fallback.enabled: true` and the request is non-streaming, `model.route` returns `TargetKind: "self"`. The plugin executor tries policy-allowed candidates through `host.model.execute`, prioritizing healthy targets before applying `max_attempts`. Retryable quota/cooldown RPC errors advance to the next target; non-retryable RPC errors return an explicit failure. See [executor fallback configuration](docs/configuration.md#executor_fallback) for cooldown timing and session-chain behavior.
 
 ## Configuration Example
 

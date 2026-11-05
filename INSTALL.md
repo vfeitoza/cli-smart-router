@@ -243,7 +243,7 @@ executor_fallback:
   max_attempts: 3
 ```
 
-When enabled, non-streaming requests for `virtual_model` route to the plugin's own executor. The executor tries configured candidates in order through `host.model.execute`. Streaming fallback is not implemented yet; streaming requests continue through provider routing.
+When enabled, non-streaming requests for `virtual_model` route to the plugin's own executor. The executor tries policy-allowed candidates through `host.model.execute`, prioritizing healthy targets before `max_attempts`. Retryable quota/cooldown errors advance to another target; cooldowns use bounded `Retry-After` values or a 30-second default. Streaming fallback is not implemented yet; streaming requests continue through provider routing.
 
 ## Upgrade
 

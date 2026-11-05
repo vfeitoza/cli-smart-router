@@ -441,6 +441,8 @@ Maximum number of configured candidates the executor fallback tries.
 
 Default in code when `<= 0`: `3`
 
+Retryable host RPC errors advance to the next policy-allowed candidate. Quota, rate-limit, cooldown, and unavailable-auth errors also record an in-memory target cooldown: 30 seconds by default, or `Retry-After` delta seconds/HTTP-date when available, bounded between 1 second and 10 minutes. Healthy targets precede cooling targets before `max_attempts` truncation, including cached policy chains. Successful execution clears the target cooldown. An explicit execution session without a cached policy chain fails closed; requests without a session retain configured-model fallback. Non-retryable RPC errors return an error immediately, never an empty success. Streaming behavior is unchanged.
+
 ## `classifier`
 
 Controls optional LLM-based semantic routing.

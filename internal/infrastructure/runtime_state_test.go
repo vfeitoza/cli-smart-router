@@ -107,3 +107,46 @@ func TestRuntimeStateFallbackChain(t *testing.T) {
 		t.Fatalf("expected empty session id to return no chain")
 	}
 }
+
+func TestRuntimeStateCooldown(t *testing.T) {
+	state := NewRuntimeState()
+	now := time.Now()
+
+	// Initial state: not cooling
+	if state.IsCooling("codex", "gpt-5.4-mini", now) {
+		t.Fatal("expected not cooling initially")
+	}
+
+	// Set cooldown
+	until := now.Add(30 * time.Second)
+	state.SetCooldown("codex", "gpt-5.4-mini", until)
+	if !state.IsCooling("codex", "gpt-5.4-mini", now) {
+		t.Fatal("expected cooling after SetCooldown")
+	}
+
+	// Cooldown until check
+	gotUntil, cooling := state.CooldownUntil("codex", "gpt-5.4-mini", now)
+	if !cooling || !gotUntil.Equal(until) {
+		t.Fatalf("expected until %v, got %v cooling=%v", until, gotUntil, cooling)
+	}
+
+	// Clear cooldown on success
+	state.ClearCooldown("codex", "gpt-5.4-mini")
+	if state.IsCooling("codex", "gpt-5.4-mini", now) {
+		t.Fatal("expected not cooling after ClearCooldown")
+	}
+
+	// Recovered cooldown eviction
+	state.SetCooldown("codex", "gpt-5.4-mini", now.Add(10*time.Millisecond))
+	future := now.Add(50 * time.Millisecond)
+	if state.IsCooling("codex", "gpt-5.4-mini", future) {
+		t.Fatal("expected not cooling after expiry")
+	}
+	// Verify evicted from map
+	state.mu.Lock()
+	_, exists := state.cooldowns["codex/gpt-5.4-mini"]
+	state.mu.Unlock()
+	if exists {
+		t.Fatal("expected expired cooldown to be evicted from map")
+	}
+}

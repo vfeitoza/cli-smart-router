@@ -1,6 +1,20 @@
 package domain
 
-import "strings"
+import (
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+)
+
+const (
+	// DefaultCooldown is the fallback cooldown duration when no Retry-After is specified.
+	DefaultCooldown = 30 * time.Second
+	// MaxCooldown bounds the maximum cooldown duration.
+	MaxCooldown = 10 * time.Minute
+	// MinCooldown bounds the minimum cooldown duration.
+	MinCooldown = 1 * time.Second
+)
 
 // FailureReason classifies why an attempt against a model failed. The Fallback
 // Engine reacts to any of these by moving to the next policy-allowed model.
@@ -51,10 +65,10 @@ func ClassifyFailure(outcome AttemptOutcome) FailureReason {
 		if containsAny(lowerErr, "context length", "context window", "maximum context", "too long", "context exceeded") {
 			return FailureContextExceeded
 		}
-		if containsAny(lowerErr, "token limit", "max tokens", "maximum tokens", "too many tokens") {
+		if containsAny(lowerErr, "token limit", "max tokens", "maximum tokens", "too many tokens", "rate limit", "rate_limit", "quota") {
 			return FailureTokenLimit
 		}
-		if containsAny(lowerErr, "unavailable", "no healthy", "connection refused", "no such host", "overloaded") {
+		if containsAny(lowerErr, "unavailable", "no healthy", "connection refused", "no such host", "overloaded", "model_cooldown", "cooling down", "cooling_down", "cooldown", "auth_unavailable", "auth unavailable") {
 			return FailureUnavailable
 		}
 	}
@@ -132,7 +146,182 @@ func MarkFailed(failed map[string]struct{}, provider, model string) {
 	failed[fallbackKey(provider, model)] = struct{}{}
 }
 
+// FallbackKey builds the dedupe key for a provider/model pair.
+func FallbackKey(provider, model string) string {
+	return strings.ToLower(strings.TrimSpace(provider)) + "/" + strings.TrimSpace(model)
+}
+
 // fallbackKey builds the dedupe key for a provider/model pair.
 func fallbackKey(provider, model string) string {
-	return strings.ToLower(strings.TrimSpace(provider)) + "/" + strings.TrimSpace(model)
+	return FallbackKey(provider, model)
+}
+
+// CandidateTarget represents a provider/model target for fallback ordering.
+type CandidateTarget struct {
+	Provider string
+	Model    string
+}
+
+// OrderCandidatesByCooldown orders healthy targets before cooling targets,
+// sorting cooling targets by earliest expiry while preserving original relative
+// order for healthy targets and ties, then truncating to maxAttempts.
+func OrderCandidatesByCooldown(
+	targets []CandidateTarget,
+	cooldownExpiry func(provider, model string) (time.Time, bool),
+	maxAttempts int,
+) []CandidateTarget {
+	if len(targets) == 0 {
+		return nil
+	}
+	type coolingTarget struct {
+		target CandidateTarget
+		until  time.Time
+		index  int
+	}
+
+	healthy := make([]CandidateTarget, 0, len(targets))
+	cooling := make([]coolingTarget, 0, len(targets))
+
+	for i, t := range targets {
+		if until, isCooling := cooldownExpiry(t.Provider, t.Model); isCooling {
+			cooling = append(cooling, coolingTarget{target: t, until: until, index: i})
+		} else {
+			healthy = append(healthy, t)
+		}
+	}
+
+	sort.SliceStable(cooling, func(i, j int) bool {
+		if cooling[i].until.Equal(cooling[j].until) {
+			return cooling[i].index < cooling[j].index
+		}
+		return cooling[i].until.Before(cooling[j].until)
+	})
+
+	ordered := make([]CandidateTarget, 0, len(targets))
+	ordered = append(ordered, healthy...)
+	for _, c := range cooling {
+		ordered = append(ordered, c.target)
+	}
+
+	if maxAttempts > 0 && len(ordered) > maxAttempts {
+		ordered = ordered[:maxAttempts]
+	}
+	return ordered
+}
+
+// ParseRetryAfter parses an HTTP Retry-After header value, which may be either
+// a delta in seconds (e.g. "120") or an HTTP-date.
+func ParseRetryAfter(value string, now time.Time) (time.Duration, bool) {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return 0, false
+	}
+	if seconds, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if seconds <= 0 {
+			return 0, false
+		}
+		// Saturate before multiplication so untrusted delta-seconds cannot wrap.
+		if seconds > int64((1<<63-1)/time.Second) {
+			return time.Duration(1<<63 - 1), true
+		}
+		return time.Duration(seconds) * time.Second, true
+	}
+	for _, layout := range []string{
+		time.RFC1123,
+		time.RFC1123Z,
+		time.RFC850,
+		time.ANSIC,
+		time.RFC3339,
+	} {
+		if t, err := time.Parse(layout, v); err == nil {
+			diff := t.Sub(now)
+			if diff <= 0 {
+				return 0, false
+			}
+			return diff, true
+		}
+	}
+	return 0, false
+}
+
+// CalculateCooldown determines the cooldown duration from a Retry-After header,
+// applying default short cooldown and bounding between MinCooldown and MaxCooldown.
+func CalculateCooldown(retryAfterHeader string, now time.Time) time.Duration {
+	if d, ok := ParseRetryAfter(retryAfterHeader, now); ok {
+		if d > MaxCooldown {
+			return MaxCooldown
+		}
+		if d < MinCooldown {
+			return MinCooldown
+		}
+		return d
+	}
+	return DefaultCooldown
+}
+
+// IsRetryableRPCError reports whether an RPC error from the host is retryable.
+// Retryable errors include model_cooldown, cooling down, quota/rate limit,
+// auth_unavailable, timeouts, and availability errors. Nonretryable errors
+// (e.g. invalid requests, unknown methods, arbitrary client errors) must fail fast.
+func IsRetryableRPCError(errText string) bool {
+	if strings.TrimSpace(errText) == "" {
+		return false
+	}
+	lower := strings.ToLower(errText)
+	patterns := []string{
+		"model_cooldown",
+		"cooling down",
+		"cooling_down",
+		"cooldown",
+		"quota",
+		"rate limit",
+		"rate_limit",
+		"rate-limit",
+		"too many requests",
+		"auth_unavailable",
+		"auth unavailable",
+		"timeout",
+		"timed out",
+		"deadline exceeded",
+		"unavailable",
+		"overloaded",
+		"no healthy",
+		"connection refused",
+		"connection reset",
+		"no such host",
+	}
+	for _, p := range patterns {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsCooldownError reports whether an error or status indicates the target should
+// be placed into cooldown (cooldown notice, quota, rate limit, auth unavailable).
+func IsCooldownError(errText string) bool {
+	if strings.TrimSpace(errText) == "" {
+		return false
+	}
+	lower := strings.ToLower(errText)
+	patterns := []string{
+		"model_cooldown",
+		"cooling down",
+		"cooling_down",
+		"cooldown",
+		"quota",
+		"rate limit",
+		"rate_limit",
+		"rate-limit",
+		"too many requests",
+		"auth_unavailable",
+		"auth unavailable",
+	}
+	for _, p := range patterns {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
 }
