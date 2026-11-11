@@ -2,6 +2,68 @@ package domain
 
 import "testing"
 
+func TestEvaluateRoutesTaskCondition(t *testing.T) {
+	candidates := []Candidate{
+		{Provider: "test-provider", Model: "test-catch-all"},
+		{Provider: "test-provider", Model: "test-task"},
+	}
+	evaluators := []struct {
+		name string
+		run  func([]RouteRule, RouteFacts, []Candidate, []string) []PolicyDecision
+	}{
+		{"EvaluateRoutes", func(rules []RouteRule, facts RouteFacts, candidates []Candidate, providers []string) []PolicyDecision {
+			return []PolicyDecision{EvaluateRoutes(rules, facts, candidates, providers)}
+		}},
+		{"EvaluateRoutesRanked", EvaluateRoutesRanked},
+	}
+	tests := []struct {
+		name        string
+		intent      Intent
+		task        string
+		wantOrder   []int
+		specificity int
+	}{
+		{"unknown_matches_unknown", IntentUnknown, "unknown", []int{1, 0}, 1},
+		{"known_does_not_match_unknown", IntentCoding, "unknown", []int{0}, 0},
+		{"known_matches_own_task", IntentCoding, "coding", []int{1, 0}, 1},
+		{"omitted_task_matches_unknown", IntentUnknown, "", []int{0, 1}, 0},
+		{"omitted_task_matches_known", IntentCoding, "", []int{0, 1}, 0},
+	}
+	for _, evaluator := range evaluators {
+		t.Run(evaluator.name, func(t *testing.T) {
+			for _, tt := range tests {
+				t.Run(tt.name, func(t *testing.T) {
+					rules := []RouteRule{
+						{Provider: "test-provider", Model: "test-catch-all"},
+						{When: RouteCondition{Task: tt.task}, Provider: "test-provider", Model: "test-task"},
+					}
+					got := evaluator.run(rules, RouteFacts{Task: tt.intent}, candidates, []string{"test-provider"})
+					wantOrder := tt.wantOrder
+					if evaluator.name == "EvaluateRoutes" {
+						wantOrder = wantOrder[:1]
+					}
+					if len(got) != len(wantOrder) {
+						t.Fatalf("got decisions %+v, want rule order %v", got, wantOrder)
+					}
+					for i, ruleIndex := range wantOrder {
+						wantSpecificity := 0
+						if ruleIndex == 1 {
+							wantSpecificity = tt.specificity
+						}
+						decision := got[i]
+						if !decision.Matched || decision.RuleIndex != ruleIndex ||
+							decision.Provider != rules[ruleIndex].Provider || decision.Model != rules[ruleIndex].Model ||
+							decision.Specificity != wantSpecificity {
+							t.Errorf("decision[%d] = %+v, want matched rule %d (%s/%s) with specificity %d",
+								i, decision, ruleIndex, rules[ruleIndex].Provider, rules[ruleIndex].Model, wantSpecificity)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestEvaluateRoutesMatchesExampleRule(t *testing.T) {
 	// routes:
 	//   - when: {task: coding, language: go, complexity: low}

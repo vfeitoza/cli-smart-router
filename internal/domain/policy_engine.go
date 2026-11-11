@@ -51,7 +51,7 @@ type condition struct {
 var conditions = []condition{
 	{
 		active: func(c RouteCondition) bool { return c.Task != "" },
-		match:  func(c RouteCondition, f RouteFacts) bool { return c.Task == string(f.Task) },
+		match:  func(c RouteCondition, f RouteFacts) bool { return c.Task == f.Task.String() },
 	},
 	{
 		active: func(c RouteCondition) bool { return c.Language != "" },
